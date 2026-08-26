@@ -2,6 +2,11 @@
 
 ## Requirements
 
+- Remove the public caller-supplied ledger verifier boundary; AAC v4
+  verification remains mandatory and internally owned.
+- Rename the extension-only `Registries` input to `RegistryExtensions`.
+- Make the complete Producer to Ledger to Checkpoint to external Witness
+  example a prominent README integration section.
 - Create `/Users/ezhang/Github/capsule-ledger-go` and publish it under the
   `ethanyzhang` GitHub account.
 - Implement ledger plus CLL/MMR in Go.
@@ -21,6 +26,32 @@
   implementation is not complete until required checks pass remotely.
 
 ## Research Findings
+
+- `AACVerifier` was the only production implementation of the former ledger
+  `Verifier` interface, and no service test used an injected fake. The public
+  seam therefore weakened the mandatory format-4 invariant without supporting
+  an actual alternate implementation.
+- The standard registry baseline already lives in `registry_baseline.go` and
+  is always merged before upstream verification. The public map is extensions
+  only and is now named and copied accordingly.
+- The anchor package's small receipt `Verifier` interface remains valid: it is
+  a separate trust boundary used by the delivery runner and has both the real
+  pinned-key implementation and test substitutes.
+- Correctness review found that `Audit(MaxScanLimit)` requested
+  `MaxScanLimit+1` records from stores that reject that limit. Audit now scans
+  the requested bound and performs a one-record continuation probe only when
+  the first scan fills the bound.
+- Correctness review found that the design used conceptual witness interface
+  names where the code block otherwise looked literal. It now names the actual
+  `anchor.Submitter` and `anchor.Verifier` contracts and identifies the concrete
+  `ReceiptVerifier` implementation.
+- The quality `/simplify` pass produced six findings. All underlying concerns
+  were accepted: the audit continuation probe now uses `ScanIDs`; registry key,
+  copy, and additive rules are documented; one constructor owns the immutable
+  standalone verifier registry set; duplicated registered-value filtering and
+  test fixture mutation were consolidated; audit-bound tests are isolated and
+  cover exact and exceeded bounds; and both `RunOnce` boolean contracts are
+  documented and named accurately in the README example.
 
 - Refreshed source baselines on August 25, 2026:
   - `agent-action-capsule` `origin/main` at
@@ -59,10 +90,12 @@
   findings for the private publication effect type. `capsule-ledger-go` is a
   transport/storage dependency of that profile, not the schema reader or
   application-profile authority.
-- The ledger should depend on the upstream AAC verifier and envelope verifier
-  directly behind repository-owned interfaces. It should not import producer
-  construction APIs merely to verify stored records, and it must support
-  caller-supplied registry extensions or the upstream registry baseline.
+- The ledger depends directly on the upstream AAC verifier and envelope
+  verifier through its concrete `AACVerifier` adapter. The public service
+  constructor installs that adapter rather than accepting a replaceable
+  verifier. It does not import producer construction APIs merely to verify
+  stored records, and callers may only add registry extensions to the embedded
+  upstream baseline.
 - Current Python `LogSource` is a structural protocol with `append`, `scan`,
   `fetch`, `verify`, and `find_gaps`; CLL MMR indexing actually depends on a
   gapless 1-indexed `seq` plus `capsule_id`.

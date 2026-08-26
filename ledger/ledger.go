@@ -14,22 +14,38 @@ import (
 // Clock supplies append timestamps for deterministic hosts and tests.
 type Clock func() time.Time
 
+// Config controls application vocabulary extensions and deterministic time.
+// AAC format-4 verification itself is mandatory and is not replaceable by the
+// host.
+type Config struct {
+	// RegistryExtensions adds application vocabulary under the registry names
+	// in registry_baseline.go, for example "effect.type". Only true values are
+	// added; extensions cannot remove baseline values. New copies the map.
+	RegistryExtensions map[string]map[string]bool
+	Clock              Clock
+}
+
 // Service verifies input before delegating exact bytes to a Store.
 type Service struct {
 	store    Store
-	verifier Verifier
+	verifier AACVerifier
 	now      Clock
 }
 
-// New constructs a ledger Service without starting background work.
-func New(store Store, verifier Verifier, clock Clock) (*Service, error) {
-	if store == nil || verifier == nil {
-		return nil, fmt.Errorf("%w: store and verifier are required", ErrInvalid)
+// New constructs a ledger Service with mandatory AAC format-4 verification
+// and without starting background work.
+func New(store Store, config Config) (*Service, error) {
+	if store == nil {
+		return nil, fmt.Errorf("%w: store is required", ErrInvalid)
 	}
-	if clock == nil {
-		clock = time.Now
+	if config.Clock == nil {
+		config.Clock = time.Now
 	}
-	return &Service{store: store, verifier: verifier, now: clock}, nil
+	return &Service{
+		store:    store,
+		verifier: NewAACVerifier(config.RegistryExtensions),
+		now:      config.Clock,
+	}, nil
 }
 
 func (s *Service) Append(ctx context.Context, capsule []byte, envelopes ...[]byte) (Record, error) {
@@ -112,18 +128,20 @@ func (s *Service) Audit(ctx context.Context, maxRecords int) ([]RecordVerificati
 	if maxRecords <= 0 || maxRecords > MaxScanLimit {
 		return nil, fmt.Errorf("%w: audit bound %d", ErrInvalid, maxRecords)
 	}
-	auditor, ok := s.verifier.(AuditVerifier)
-	if !ok {
-		return nil, fmt.Errorf("%w: verifier does not support store audit", ErrInvalid)
-	}
-	records, err := s.store.Scan(ctx, 0, maxRecords+1)
+	records, err := s.store.Scan(ctx, 0, maxRecords)
 	if err != nil {
 		return nil, err
 	}
-	if len(records) > maxRecords {
-		return nil, fmt.Errorf("%w: ledger exceeds audit bound %d", ErrInvalid, maxRecords)
+	if len(records) == maxRecords {
+		extra, err := s.store.ScanIDs(ctx, records[len(records)-1].Seq, 1)
+		if err != nil {
+			return nil, err
+		}
+		if len(extra) > 0 {
+			return nil, fmt.Errorf("%w: ledger exceeds audit bound %d", ErrInvalid, maxRecords)
+		}
 	}
-	return auditor.VerifyRecords(records), nil
+	return s.verifier.VerifyRecords(records), nil
 }
 
 func capsuleParent(data []byte) (CapsuleID, error) {

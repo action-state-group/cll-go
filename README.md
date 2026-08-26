@@ -19,6 +19,15 @@ It provides:
 The CLL commits ordered Capsule IDs. Producer Envelopes remain independently
 verified ledger associations and do not create CLL leaves.
 
+## Install
+
+The end-to-end integration uses both the producer and ledger modules:
+
+```sh
+go get github.com/ethanyzhang/capsule-producer-go@latest
+go get github.com/ethanyzhang/capsule-ledger-go@latest
+```
+
 ## Storage
 
 Choose one backend:
@@ -33,42 +42,192 @@ SQLite is the simplest transactional choice for one server process. JSONL is
 an inspectable append-only journal. MySQL supports shared infrastructure and is
 tested against a real MySQL 8 container.
 
-## Host lifecycle
+## End-to-end: Producer to Ledger to Witness
 
-Importing the module starts no goroutines and makes no network calls. A host
-such as Alchemy starts the runners under its server context:
+The producer key signs one independent Producer Envelope. The checkpoint key
+signs the local CLL checkpoint. The pinned anchor authority public key verifies
+the external service's receipt. These are three separate trust roles, and the
+host must provision and authorize their keys outside this library.
+
+This synchronous example sets the checkpoint cadence to one Capsule so the
+whole path is visible in one call. `anchorBaseURL` identifies an already-running
+external `capsule-anchor`; this library does not start an anchor service.
 
 ```go
-service, err := ledger.New(store, ledger.AACVerifier{}, nil)
+package integration
 
-checkpointRunner, err := checkpoint.NewRunner(
-    checkpoint.DefaultRunnerConfig("alchemy-investigations"),
-    store,
-    checkpointSigner,
-)
-go func() {
-    if err := checkpointRunner.Run(serverContext); err != nil &&
-        !errors.Is(err, context.Canceled) {
-        report(err)
-    }
-}()
+import (
+    "context"
+    "crypto/ed25519"
+    "errors"
+    "fmt"
+    "time"
 
-deliveryRunner, err := anchor.NewDeliveryRunner(
-    anchor.DefaultDeliveryConfig("production-anchor"),
-    store,
-    anchorClient,
-    receiptVerifier,
+    producer "github.com/ethanyzhang/capsule-producer-go"
+
+    "github.com/ethanyzhang/capsule-ledger-go/checkpoint"
+    "github.com/ethanyzhang/capsule-ledger-go/ledger"
+    "github.com/ethanyzhang/capsule-ledger-go/store/sqlite"
+    "github.com/ethanyzhang/capsule-ledger-go/witness/anchor"
 )
-go func() {
-    if err := deliveryRunner.Run(serverContext); err != nil &&
-        !errors.Is(err, context.Canceled) {
-        report(err)
+
+func PublishInvestigation(
+    ctx context.Context,
+    databasePath string,
+    anchorBaseURL string,
+    producerPrivateKey ed25519.PrivateKey,
+    checkpointPrivateKey ed25519.PrivateKey,
+    anchorAuthorityPublicKey ed25519.PublicKey,
+) (finalErr error) {
+    const (
+        logID     = "alchemy-investigations-prod"
+        witnessID = "production-anchor"
+    )
+
+    // Open one durable ledger stream. Reuse logID across process restarts.
+    store, err := sqlite.Open(databasePath, logID)
+    if err != nil {
+        return err
     }
-}()
+    defer func() { finalErr = errors.Join(finalErr, store.Close()) }()
+
+    // AAC format-4 verification is mandatory and owned by ledger.New. The
+    // host may add application vocabulary but cannot replace verification.
+    service, err := ledger.New(store, ledger.Config{
+        RegistryExtensions: map[string]map[string]bool{
+            "effect.type": {
+                "urn:alchemy:effect:github-issue-comment-publication:v1": true,
+            },
+        },
+    })
+    if err != nil {
+        return err
+    }
+
+    // Build a signature-free Capsule and one independent Producer Envelope.
+    producerIdentity, err := producer.NewEd25519SigningIdentity(producerPrivateKey)
+    if err != nil {
+        return err
+    }
+    produced, err := producer.Seal(producer.Input{
+        ActionID:   "investigation-123",
+        ActionType: producer.ActionTypeDecide,
+        Operator:   "alchemy",
+        Developer:  "alchemy@1.0.0",
+        Timestamp:  time.Now().UTC(),
+        Disposition: &producer.Disposition{
+            Decision:      producer.DecisionAccept,
+            Approver:      producer.ApproverPolicy,
+            VerdictClass:  producer.VerdictExecuted,
+            HumanDisposed: false,
+        },
+    }, producerIdentity)
+    if err != nil {
+        return err
+    }
+
+    // Verify exact Capsule and Envelope bytes, allocate seq, and persist them.
+    record, err := service.Append(ctx, produced.Payload, produced.Envelope)
+    if err != nil {
+        return err
+    }
+    fmt.Printf("stored seq=%d capsule_id=%s\n", record.Seq, record.CapsuleID)
+
+    // Read new Capsule IDs from the same Store, advance the CLL/MMR, sign a
+    // checkpoint, and atomically create its pending witness-delivery row.
+    checkpointSigner, err := checkpoint.NewEd25519Signer(
+        "alchemy-checkpoint-key-1",
+        checkpointPrivateKey,
+    )
+    if err != nil {
+        return err
+    }
+    checkpointConfig := checkpoint.DefaultRunnerConfig(logID)
+    checkpointConfig.Cadence.CadenceEntries = 1 // demonstration only
+    checkpointConfig.WitnessIDs = []string{witnessID}
+    checkpointRunner, err := checkpoint.NewRunner(
+        checkpointConfig,
+        store,
+        checkpointSigner,
+    )
+    if err != nil {
+        return err
+    }
+    advanced, err := checkpointRunner.RunOnce(ctx, time.Now().UTC())
+    if err != nil {
+        return err
+    }
+    if !advanced {
+        return fmt.Errorf("checkpoint runner made no progress")
+    }
+
+    // POST the signed checkpoint to the external anchor and verify its receipt
+    // locally under trust material provisioned independently of that server.
+    anchorClient, err := anchor.NewClient(anchorBaseURL, nil, 0)
+    if err != nil {
+        return err
+    }
+    receiptVerifier, err := anchor.NewReceiptVerifier(anchorAuthorityPublicKey)
+    if err != nil {
+        return err
+    }
+    deliveryRunner, err := anchor.NewDeliveryRunner(
+        anchor.DefaultDeliveryConfig(witnessID),
+        store,
+        anchorClient,
+        receiptVerifier,
+    )
+    if err != nil {
+        return err
+    }
+    attempted, err := deliveryRunner.RunOnce(ctx, time.Now().UTC())
+    if err != nil {
+        return err
+    }
+    if !attempted {
+        return fmt.Errorf("no checkpoint was ready for a delivery attempt")
+    }
+
+    state, err := store.LoadCLL(ctx)
+    if err != nil {
+        return err
+    }
+    if len(state.Checkpoints) == 0 {
+        return fmt.Errorf("checkpoint is missing")
+    }
+    latest := state.Checkpoints[len(state.Checkpoints)-1]
+    witnessed, err := store.GetWitness(ctx, witnessID, latest.MMRSize)
+    if err != nil {
+        return err
+    }
+    if witnessed.State != ledger.WitnessVerified {
+        return fmt.Errorf("witness delivery ended in state %s", witnessed.State)
+    }
+    return nil
+}
 ```
 
-After a successful append, `checkpointRunner.Notify()` can reduce latency.
-Notifications are optional; the durable sequence scan recovers lost signals.
+The call path is:
+
+```text
+producer.Seal
+    -> Capsule + Producer Envelope
+ledger.Service.Append
+    -> durable Capsule record with seq
+checkpoint.Runner.RunOnce
+    -> durable CLL/MMR checkpoint + pending delivery
+anchor.DeliveryRunner.RunOnce
+    -> POST /transparency/register-statement
+    -> offline receipt verification
+    -> durable verified witness result
+```
+
+In a long-running Alchemy server, construct these objects once during startup
+and run `checkpointRunner.Run(serverContext)` and
+`deliveryRunner.Run(serverContext)` in server-owned goroutines. Request handlers
+only call the producer and `service.Append`. Calling `checkpointRunner.Notify()`
+after a successful append reduces latency; polling and durable cursors recover
+lost notifications and process restarts.
 
 See [DESIGN.md](DESIGN.md) for wire contracts, persistence guarantees, trust
 boundaries, and pinned interoperability baselines.

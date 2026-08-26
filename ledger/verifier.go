@@ -7,21 +7,18 @@ import (
 	aacverify "github.com/action-state-group/agent-action-capsule/go/verify"
 )
 
-// Verifier validates exact Capsule and Producer Envelope bytes.
-type Verifier interface {
-	VerifyCapsule([]byte) (VerificationResult, CapsuleID, error)
-	VerifyEnvelope(CapsuleID, []byte) (EnvelopeVerification, error)
-}
-
-// AuditVerifier recomputes store-level AAC findings.
-type AuditVerifier interface {
-	VerifyRecords([]Record) []RecordVerification
-}
-
 // AACVerifier adapts the upstream format-4 verifier without interpreting any
-// application-private registry values.
+// application-private registry values. Service construction always uses this
+// verifier; the exported concrete type remains available for explicit
+// standalone verification.
 type AACVerifier struct {
-	Registries map[string]map[string]bool
+	registries map[string]map[string]bool
+}
+
+// NewAACVerifier constructs a standalone verifier with an immutable copy of
+// application registry extensions merged into the embedded baseline.
+func NewAACVerifier(extensions map[string]map[string]bool) AACVerifier {
+	return AACVerifier{registries: mergedRegistries(extensions)}
 }
 
 func (v AACVerifier) VerifyCapsule(data []byte) (VerificationResult, CapsuleID, error) {
@@ -32,7 +29,7 @@ func (v AACVerifier) VerifyCapsule(data []byte) (VerificationResult, CapsuleID, 
 	if err != nil {
 		return VerificationResult{}, "", fmt.Errorf("%w: decode capsule: %v", ErrInvalid, err)
 	}
-	upstream := aacverify.Verify(capsule, nil, mergedRegistries(v.Registries))
+	upstream := aacverify.Verify(capsule, nil, v.registrySet())
 	result := convertVerification(upstream)
 	if !upstream.OK || upstream.CapsuleID == nil {
 		return result, result.CapsuleID, fmt.Errorf("%w: capsule verification failed", ErrInvalid)
@@ -72,7 +69,7 @@ func (v AACVerifier) VerifyRecords(records []Record) []RecordVerification {
 		parsed = append(parsed, capsule)
 		validIndexes = append(validIndexes, index)
 	}
-	verified := aacverify.VerifyStore(parsed, mergedRegistries(v.Registries))
+	verified := aacverify.VerifyStore(parsed, v.registrySet())
 	for index, upstream := range verified {
 		results[validIndexes[index]].Result = convertVerification(upstream)
 	}
@@ -82,29 +79,31 @@ func (v AACVerifier) VerifyRecords(records []Record) []RecordVerification {
 func mergedRegistries(extensions map[string]map[string]bool) map[string]map[string]bool {
 	merged := make(map[string]map[string]bool, len(baselineRegistries)+len(extensions))
 	for name, values := range baselineRegistries {
-		merged[name] = cloneSet(values)
+		merged[name] = make(map[string]bool, len(values))
+		addRegistered(merged[name], values)
 	}
 	for name, values := range extensions {
 		if merged[name] == nil {
 			merged[name] = make(map[string]bool)
 		}
-		for value, registered := range values {
-			if registered {
-				merged[name][value] = true
-			}
-		}
+		addRegistered(merged[name], values)
 	}
 	return merged
 }
 
-func cloneSet(input map[string]bool) map[string]bool {
-	output := make(map[string]bool, len(input))
+func addRegistered(output, input map[string]bool) {
 	for value, registered := range input {
 		if registered {
 			output[value] = true
 		}
 	}
-	return output
+}
+
+func (v AACVerifier) registrySet() map[string]map[string]bool {
+	if v.registries == nil {
+		return mergedRegistries(nil)
+	}
+	return v.registries
 }
 
 func (AACVerifier) VerifyEnvelope(id CapsuleID, data []byte) (EnvelopeVerification, error) {

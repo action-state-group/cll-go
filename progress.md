@@ -2,6 +2,43 @@
 
 ## Session: 2026-08-25
 
+### Phase 8: Public verifier API cleanup and end-to-end example
+
+- **Status:** in_progress
+- Actions taken:
+  - Confirmed `AACVerifier` is the only production implementation of the
+    public `Verifier` interface and that no service test uses an injected fake.
+  - Confirmed standard registries are embedded and caller values are merged
+    only as extensions.
+  - Replaced caller-supplied ledger verification with `ledger.Config`; the
+    service now always owns a concrete `AACVerifier` and copies registry
+    extensions at construction.
+  - Removed the optional audit type assertion so every constructed service
+    provides the same upstream store-level audit.
+  - Added service tests for default baseline verification, extension copying,
+    append rejection of a tampered Capsule, and audit behavior.
+  - Replaced the abbreviated lifecycle README snippet with the complete
+    Producer, ledger append, checkpoint, external anchor delivery, and receipt
+    status flow.
+  - Updated the design and findings to distinguish mandatory AAC verification
+    from genuinely replaceable storage, signing, and witness dependencies.
+  - `go vet ./...` and uncached `go test -count=1 ./...` passed, including the
+    real MySQL 8 Testcontainers suite.
+  - Correctness cross-review accepted and fixed the unusable
+    `Audit(MaxScanLimit)` path and conceptual witness interface names; the
+    resumed reviewer returned `CONVERGED`.
+  - Quality `/simplify` accepted six simplifications covering the narrow audit
+    probe, registry ownership and documentation, duplicate test helpers,
+    audit-bound test scope, and `RunOnce` boolean semantics.
+  - Cleanup verification on the complete staged diff returned `CONVERGED`.
+    Kimi remained unavailable due billing-cycle quota and Bob due budget; both
+    were recorded and skipped without idling.
+  - Final `go fmt ./...`, `go mod tidy`, `go vet ./...`, uncached unit tests,
+    and uncached race tests passed, including real MySQL 8 Testcontainers in
+    both test modes. The complete README Go example also passed syntax format
+    validation, and the peer ran it end to end against a receipt-minting fake
+    anchor.
+
 ### Phase 1: Repository bootstrap and source-grounded discovery
 
 - **Status:** completed
@@ -137,6 +174,7 @@
 | Full local validation before final cleanup | fmt, tidy, vet, unit, MySQL integration | All packages pass | All packages passed, including three Testcontainers suites | Pass |
 | Final uncached validation | `go test -count=1 ./...` and `go test -race -count=1 ./...` | Every package passes without cache | Every package passed; MySQL Testcontainers passed in both runs | Pass |
 | Remote GitHub Actions | Run `32925890784` on implementation commit `5f3e821` | Required CI passes on the pushed commit | Format, module, vet, ordinary test, race test, and MySQL Testcontainers all passed | Pass |
+| Phase 8 local validation | fmt, tidy, vet, uncached unit and race suites | Every package and real MySQL integration passes | All checks passed; README full Go example passed syntax validation and peer end-to-end execution | Pass |
 
 ## Error Log
 

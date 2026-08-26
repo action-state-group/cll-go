@@ -9,7 +9,7 @@ SQLite, and MySQL storage implementations, and an external witness boundary.
 
 ## Current Phase
 
-Phase 2
+Phase 8
 
 ## Phases
 
@@ -89,6 +89,25 @@ Phase 2
 - [x] Record final tests, review convergence, limitations, and handoff.
 - **Status:** completed
 
+### Phase 8: Public verifier API cleanup and end-to-end example
+
+- [x] Remove caller-supplied verifier interfaces from the public ledger
+  constructor while preserving mandatory AAC v4 verification and audit.
+- [x] Rename the caller vocabulary field to `RegistryExtensions` and copy its
+  configuration defensively.
+- [x] Add same-change tests for default construction, registry extensions,
+  append verification, and audit.
+- [x] Make the Producer to Ledger to Checkpoint to Witness example a prominent,
+  complete README integration section.
+- [x] Update design references and search for the superseded constructor and
+  field names.
+- [x] Run format, tidy, vet, unit, race, integration, and documentation checks.
+- [x] Converge correctness, quality `/simplify`, and cleanup review with every
+  available peer; record unavailable peers without blocking.
+- [ ] Commit with DCO sign-off, push `main`, and verify GitHub Actions on the
+  final remote SHA.
+- **Status:** in_progress
+
 ## Key Questions
 
 1. What exact upstream AAC v4 module ref and vector corpus should the first
@@ -110,11 +129,16 @@ Phase 2
 | Producer responsibilities stay outside this repository | `capsule-producer-go` owns AAC construction and Producer Envelope creation; the ledger verifies and persists their output. |
 | Planning and both cross-review gates are mandatory | Explicit user requirement; design must converge before implementation and implementation must converge before delivery. |
 | GitHub Actions CI is a release requirement | The user explicitly required CI after implementation; local success alone is insufficient. |
+| The public ledger constructor owns AAC v4 verification | AAC v4 verification is a mandatory safety invariant, not a host-replaceable plugin; hosts may only add registry vocabulary extensions. |
+| Keep the concrete `AACVerifier` available for standalone checks | Removing host replacement from `Service` does not require hiding the useful concrete adapter; the safety boundary is the constructor. |
 
 ## Errors Encountered
 
 | Error | Attempt | Resolution |
 |---|---|---|
+| Phase 8 planning patch expected `## User requirements`, but the file uses `## Requirements` | 1 | Re-read the planning-file headings and apply a targeted patch against the actual structure. |
+| New audit test expected the one-record chained fixture to be store-valid | 1 | Assert its intentional `chain_parent_missing` result while independently proving the configured registry extension remains recognized. |
+| Bob availability probe used the cross-review cleanup pattern but the shell safety layer rejected `rm -f` | 1 | Use Bob's direct result envelope for the small availability probe; Bob then reported its actual budget blocker. |
 | `agent-action-capsule` has no root `go.mod` | 1 | Treat the upstream Go reference as a nested module and locate it through the repository tree before pinning. |
 | `go mod tidy` warned that `all` matched no packages | 1 | Expected during the documentation-only bootstrap; rerun after the first Go package is added. |
 | Source-refresh loop assigned zsh's special `path` variable and removed command lookup | 1 | Use a task-specific `repo_dir` variable; never assign zsh's tied `path` parameter. |

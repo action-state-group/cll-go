@@ -84,6 +84,9 @@ func (r *DeliveryRunner) Run(ctx context.Context) error {
 	}
 }
 
+// RunOnce persists at most one eligible delivery attempt. Its boolean is true
+// when an attempt result was committed, including retryable and terminal
+// failures, not only verified delivery.
 func (r *DeliveryRunner) RunOnce(ctx context.Context, now time.Time) (bool, error) {
 	now = ledger.NormalizeTime(now)
 	pending, err := r.store.PendingWitnesses(ctx, r.config.WitnessID, 1)

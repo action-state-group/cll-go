@@ -89,6 +89,9 @@ func (r *Runner) Run(ctx context.Context) error {
 	}
 }
 
+// RunOnce advances durable CLL state by at most one scan batch. Its boolean is
+// true for any committed progress, whether or not that progress included a
+// checkpoint.
 func (r *Runner) RunOnce(ctx context.Context, now time.Time) (bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

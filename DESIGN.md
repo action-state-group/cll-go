@@ -178,11 +178,13 @@ type Signer interface {
     VerifyCheckpoint(payload, statement []byte) error
 }
 
-type WitnessClient interface {
+// witness/anchor.Submitter
+type Submitter interface {
     Submit(ctx context.Context, signedStatement []byte) (Receipt, error)
 }
 
-type ReceiptVerifier interface {
+// witness/anchor.Verifier; ReceiptVerifier is its pinned-key implementation.
+type Verifier interface {
     Verify(statement []byte, receipt Receipt) error
 }
 ```
@@ -199,7 +201,8 @@ cursor-to-leaf-count relationship before extending the log.
 
 ## AAC format-4 verification
 
-The default verifier calls the upstream Go functions at the recorded baseline:
+The mandatory ledger verifier calls the upstream Go functions at the recorded
+baseline:
 
 - `verify.Verify(parsedCapsule, completeStoreOrNil, registries)`; and
 - `envelope.Verify(capsuleID, exactEnvelopeBytes)`.
@@ -213,12 +216,14 @@ The library vendors the baseline `spec/REGISTRY.md` with BSD-3-Clause
 attribution and embeds its parsed map as Go data. A test loads the vendored file
 with upstream `registries.Load` and asserts exact equality with the embedded map
 at the pinned commit. Runtime always passes a non-nil complete map and never
-relies on the host working directory or `AAC_REGISTRY_PATH`. Caller extensions
-merge into a copy of that baseline. A non-nil empty map is not a valid baseline.
-An informational unknown registry value never becomes an append failure.
+relies on the host working directory or `AAC_REGISTRY_PATH`. The public ledger
+constructor always installs this verifier and accepts only caller registry
+extensions, which it defensively copies and merges into the baseline. The host
+cannot replace AAC format-4 verification. An informational unknown registry
+value never becomes an append failure.
 
 Append performs Class 1 per-Capsule verification with caller-configurable
-registries. Chain existence changes as later records arrive, so
+registry extensions. Chain existence changes as later records arrive, so
 `FindChainGaps` and `Audit`, backed by `verify.VerifyStore`, provide store-level
 results. `Audit` returns `RecordVerification{Seq, CapsuleID, Result, Error}` so
 a result remains attributable when recomputation fails. It is operator-only and
@@ -488,8 +493,10 @@ internal/storetest/ shared three-backend contract suites
 ledger/testdata/    attributed AAC registry and Capsule vectors
 ```
 
-No package imports Alchemy. Constructors receive interfaces; package import has
-no side effects.
+No package imports Alchemy. Storage, checkpoint signing, and external witness
+dependencies use narrow interfaces. Mandatory AAC format-4 verification is a
+concrete service invariant rather than a replaceable host plugin. Package
+import has no side effects.
 
 ## CI and release gates
 
