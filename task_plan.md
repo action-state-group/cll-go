@@ -77,17 +77,17 @@ Phase 2
   with every available peer CLI until convergence; unavailable external CLIs
   were recorded and skipped without idling.
 - [x] Re-run the full validation suite after accepted review fixes.
-- [ ] Verify the required GitHub Actions workflow passes on the pushed commit.
-- **Status:** pending
+- [x] Verify the required GitHub Actions workflow passes on the pushed commit.
+- **Status:** completed
 
 ### Phase 7: Delivery
 
-- [ ] Audit the complete diff, stale references, lifecycle paths, and public
+- [x] Audit the complete diff, stale references, lifecycle paths, and public
   documentation.
-- [ ] Commit all intended files with DCO sign-off and conventional commits.
-- [ ] Push the default branch and verify local HEAD equals the remote SHA.
-- [ ] Record final tests, review convergence, limitations, and handoff.
-- **Status:** in_progress
+- [x] Commit all intended files with DCO sign-off and conventional commits.
+- [x] Push the default branch and verify local HEAD equals the remote SHA.
+- [x] Record final tests, review convergence, limitations, and handoff.
+- **Status:** completed
 
 ## Key Questions
 
