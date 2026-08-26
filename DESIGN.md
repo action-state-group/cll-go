@@ -178,12 +178,12 @@ type Signer interface {
     VerifyCheckpoint(payload, statement []byte) error
 }
 
-// witness/anchor.Submitter
+// capsuleanchor.Submitter
 type Submitter interface {
     Submit(ctx context.Context, signedStatement []byte) (Receipt, error)
 }
 
-// witness/anchor.Verifier; ReceiptVerifier is its pinned-key implementation.
+// capsuleanchor.Verifier; ReceiptVerifier is its pinned-key implementation.
 type Verifier interface {
     Verify(statement []byte, receipt Receipt) error
 }
@@ -488,7 +488,7 @@ store/sqlite/       embedded SQLite backend
 store/mysql/        MySQL backend
 mmr/                CLL hashing, proofs, DataTrails adapter
 checkpoint/         payload, COSE signer, cadence, runner
-witness/anchor/     capsule-anchor client and receipt verifier
+capsuleanchor/      capsule-anchor client and receipt verifier
 internal/storetest/ shared three-backend contract suites
 ledger/testdata/    attributed AAC registry and Capsule vectors
 ```

@@ -34,7 +34,8 @@
 - The standard registry baseline already lives in `registry_baseline.go` and
   is always merged before upstream verification. The public map is extensions
   only and is now named and copied accordingly.
-- The anchor package's small receipt `Verifier` interface remains valid: it is
+- The `capsuleanchor` package's small receipt `Verifier` interface remains
+  valid: it is
   a separate trust boundary used by the delivery runner and has both the real
   pinned-key implementation and test substitutes.
 - Correctness review found that `Audit(MaxScanLimit)` requested
@@ -43,8 +44,8 @@
   the first scan fills the bound.
 - Correctness review found that the design used conceptual witness interface
   names where the code block otherwise looked literal. It now names the actual
-  `anchor.Submitter` and `anchor.Verifier` contracts and identifies the concrete
-  `ReceiptVerifier` implementation.
+  `capsuleanchor.Submitter` and `capsuleanchor.Verifier` contracts and identifies
+  the concrete `ReceiptVerifier` implementation.
 - The quality `/simplify` pass produced six findings. All underlying concerns
   were accepted: the audit continuation probe now uses `ScanIDs`; registry key,
   copy, and additive rules are documented; one constructor owns the immutable

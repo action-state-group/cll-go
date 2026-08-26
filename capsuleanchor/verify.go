@@ -1,4 +1,4 @@
-package anchor
+package capsuleanchor
 
 // Receipt verification is an attributed Go adaptation of
 // action-state-group/scitt-cose/scitt-cose-go-verify at

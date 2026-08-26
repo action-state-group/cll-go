@@ -68,7 +68,7 @@ import (
     "github.com/ethanyzhang/capsule-ledger-go/checkpoint"
     "github.com/ethanyzhang/capsule-ledger-go/ledger"
     "github.com/ethanyzhang/capsule-ledger-go/store/sqlite"
-    "github.com/ethanyzhang/capsule-ledger-go/witness/anchor"
+    "github.com/ethanyzhang/capsule-ledger-go/capsuleanchor"
 )
 
 func PublishInvestigation(
@@ -163,16 +163,16 @@ func PublishInvestigation(
 
     // POST the signed checkpoint to the external anchor and verify its receipt
     // locally under trust material provisioned independently of that server.
-    anchorClient, err := anchor.NewClient(anchorBaseURL, nil, 0)
+    anchorClient, err := capsuleanchor.NewClient(anchorBaseURL, nil, 0)
     if err != nil {
         return err
     }
-    receiptVerifier, err := anchor.NewReceiptVerifier(anchorAuthorityPublicKey)
+    receiptVerifier, err := capsuleanchor.NewReceiptVerifier(anchorAuthorityPublicKey)
     if err != nil {
         return err
     }
-    deliveryRunner, err := anchor.NewDeliveryRunner(
-        anchor.DefaultDeliveryConfig(witnessID),
+    deliveryRunner, err := capsuleanchor.NewDeliveryRunner(
+        capsuleanchor.DefaultDeliveryConfig(witnessID),
         store,
         anchorClient,
         receiptVerifier,
@@ -216,7 +216,7 @@ ledger.Service.Append
     -> durable Capsule record with seq
 checkpoint.Runner.RunOnce
     -> durable CLL/MMR checkpoint + pending delivery
-anchor.DeliveryRunner.RunOnce
+capsuleanchor.DeliveryRunner.RunOnce
     -> POST /transparency/register-statement
     -> offline receipt verification
     -> durable verified witness result

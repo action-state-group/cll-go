@@ -1,4 +1,4 @@
-package anchor
+package capsuleanchor
 
 import (
 	"crypto/ed25519"
