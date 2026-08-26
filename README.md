@@ -222,6 +222,12 @@ capsuleanchor.DeliveryRunner.RunOnce
     -> durable verified witness result
 ```
 
+The client supports both current and older hosted `capsule-anchor` responses.
+An older receipt proves checkpoint inclusion but makes no server-side
+continuity claim. Unknown or ambiguous response shapes fail closed. See the
+[witness contract](DESIGN.md#witness-rest-and-trust) for the exact profiles and
+hash rules.
+
 In a long-running Alchemy server, construct these objects once during startup
 and run `checkpointRunner.Run(serverContext)` and
 `deliveryRunner.Run(serverContext)` in server-owned goroutines. Request handlers

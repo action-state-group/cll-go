@@ -25,6 +25,28 @@ func TestReceiptVerifierBindsStatementProofAndPinnedKey(t *testing.T) {
 
 	logPublic, logPrivate, err := ed25519.GenerateKey(rand.Reader)
 	require.NoError(t, err)
+	receiptBytes := signedReceipt(t, entry, logPrivate)
+
+	verifier, err := NewReceiptVerifier(logPublic)
+	require.NoError(t, err)
+	receipt := Receipt{Bytes: receiptBytes, EntryHash: hex.EncodeToString(entry), EntryHashScheme: EntryHashSchemeSigStructure, LeafIndex: 0, TreeSize: 1}
+	require.NoError(t, verifier.Verify(statement, receipt))
+	receipt.EntryHash = hex.EncodeToString(make([]byte, 32))
+	require.Error(t, verifier.Verify(statement, receipt))
+	legacyEntry := sha256.Sum256(statement)
+	receipt = Receipt{
+		Bytes: signedReceipt(t, legacyEntry[:], logPrivate), EntryHash: hex.EncodeToString(legacyEntry[:]),
+		EntryHashScheme: EntryHashSchemeStatementBytes, LeafIndex: 0, TreeSize: 1,
+	}
+	require.NoError(t, verifier.Verify(statement, receipt))
+	receipt.EntryHashScheme = EntryHashSchemeLegacy
+	require.NoError(t, verifier.Verify(statement, receipt))
+	receipt.EntryHashScheme = "unknown"
+	require.Error(t, verifier.Verify(statement, receipt))
+}
+
+func signedReceipt(t *testing.T, entry []byte, private ed25519.PrivateKey) []byte {
+	t.Helper()
 	proof, err := cbor.Marshal([]any{int64(1), int64(0), [][]byte{}})
 	require.NoError(t, err)
 	leaf := sha256.Sum256(append([]byte{0}, entry...))
@@ -33,20 +55,11 @@ func TestReceiptVerifierBindsStatementProofAndPinnedKey(t *testing.T) {
 	receiptMessage.Headers.Protected[headerVDS] = vdsRFC9162
 	receiptMessage.Headers.Unprotected[headerVDP] = map[any]any{vdpInclusion: []any{proof}}
 	receiptMessage.Payload = leaf[:]
-	logSigner, err := cose.NewSigner(cose.AlgorithmEdDSA, logPrivate)
+	logSigner, err := cose.NewSigner(cose.AlgorithmEdDSA, private)
 	require.NoError(t, err)
 	require.NoError(t, receiptMessage.Sign(rand.Reader, nil, logSigner))
 	receiptMessage.Payload = nil
 	receiptBytes, err := receiptMessage.MarshalCBOR()
 	require.NoError(t, err)
-
-	verifier, err := NewReceiptVerifier(logPublic)
-	require.NoError(t, err)
-	receipt := Receipt{Bytes: receiptBytes, EntryHash: hex.EncodeToString(entry), EntryHashScheme: "sig_structure", LeafIndex: 0, TreeSize: 1}
-	require.NoError(t, verifier.Verify(statement, receipt))
-	receipt.EntryHash = hex.EncodeToString(make([]byte, 32))
-	require.Error(t, verifier.Verify(statement, receipt))
-	receipt.EntryHash = hex.EncodeToString(entry)
-	receipt.EntryHashScheme = "legacy"
-	require.Error(t, verifier.Verify(statement, receipt))
+	return receiptBytes
 }

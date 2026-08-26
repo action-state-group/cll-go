@@ -34,6 +34,7 @@ The design was checked against these refreshed `origin/main` commits on
 | `action-state-group/capsule-emit` | `d0ff0d725d8683a9e8f63c4980fc5fe3d7c5d443` | CLL hashing, cadence, retry, and trust behavior |
 | `action-state-group/capsule-ledger` | `01f2ae6c4e7d54793ed308a624c367e702a8d089` | sequence, chain-gap, and checkpoint persistence behavior |
 | `action-state-group/capsule-anchor` | `452d253c69bc9eb8ddb780347377c2115e6aa166` | current REST and receipt contract |
+| `action-state-group/capsule-anchor` v0.1.1 | `e6ba56e88a9199d09f111061edce357b120a472c` | older hosted response shape and exact-statement entry hash |
 | `datatrails/go-datatrails-merklelog` | `275103a34a08e56a376107246e04dc5819cc44cc` | MMRIVER-compatible Go reference and KATs |
 | `action-state-group/scitt-cose` | `36ec13992287a463481d1b00ac2098f032f229b5` | independent Go COSE/receipt verifier and conformance vectors |
 
@@ -356,11 +357,17 @@ Content-Type: application/json
 {"signed_statement_b64":"..."}
 ```
 
-It accepts only a bounded 2xx JSON response containing `receipt_b64`,
-`entry_hash`, `entry_hash_scheme`, `leaf_index`, `tree_size`, and a non-null
-`checkpoint_witness`. Echoed fields must match the submitted payload. Status
-must be `first-seen`, `witnessed`, or `already-registered`. The client requires
-`entry_hash_scheme == "sig_structure"`; `legacy` is a hard failure.
+It accepts bounded current and older-hosted 2xx JSON response profiles. The
+current profile contains `receipt_b64`, `entry_hash`, `entry_hash_scheme`,
+`leaf_index`, `tree_size`, and a non-null `checkpoint_witness`. Echoed fields
+must match the submitted payload, status must be `first-seen`, `witnessed`, or
+`already-registered`, and the scheme must be `sig_structure` or the explicit
+`legacy` value returned by the current migration dual-lookup path. The older
+hosted deployment omits both additive fields and defines `entry_hash` as
+SHA-256 of the exact COSE_Sign1 bytes. The client records that exact older shape
+locally as `statement_bytes`; it never interprets an unknown or ambiguous
+response as compatibility mode. A verified omitted-field compatibility receipt
+proves checkpoint-statement inclusion, not server-side checkpoint continuity.
 
 HTTP 409 is a permanent continuity conflict. Timeouts, 429, and 5xx are
 retryable with capped exponential backoff and jitter. `/v1/digest` is not the
@@ -373,10 +380,13 @@ statement, tree coordinates, and inclusion path. The key is configuration,
 not fetched during verification from the server being judged. Rotation is an
 explicit configuration change with an optional declared overlap.
 
-The verifier recomputes `entry_hash` as SHA-256 of the submitted statement's
-RFC 9052 `Sig_structure`, compares it with the response, then uses those bytes
-for RFC 9162 leaf and inclusion-root reconstruction. It never trusts the echoed
-entry hash as the binding source.
+The verifier recomputes `entry_hash` according to the explicit local scheme:
+SHA-256 of the submitted statement's RFC 9052 `Sig_structure` for the current
+profile, or SHA-256 of the exact submitted COSE_Sign1 bytes for an explicit
+`legacy` migration response or omitted-field hosted compatibility. It compares
+the derived value with the response, then uses those bytes for RFC 9162 leaf
+and inclusion-root reconstruction. It never trusts the echoed entry hash as the
+binding source.
 
 The implementation ports the small profile-opaque verifier core from
 `scitt-cose-go-verify` with Apache-2.0 attribution. It uses

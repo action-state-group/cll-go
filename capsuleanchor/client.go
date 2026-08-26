@@ -27,6 +27,18 @@ const DefaultRequestTimeout = 30 * time.Second
 // MaxSignedStatementBytes bounds checkpoint parsing and submission.
 const MaxSignedStatementBytes = 64 << 10
 
+const (
+	// EntryHashSchemeSigStructure is the current malleability-resistant anchor
+	// contract that commits the COSE Sig_structure.
+	EntryHashSchemeSigStructure = "sig_structure"
+	// EntryHashSchemeLegacy is capsule-anchor's explicit migration response for
+	// a statement found under its former exact-COSE-bytes entry hash.
+	EntryHashSchemeLegacy = "legacy"
+	// EntryHashSchemeStatementBytes is the deployed hosted-anchor compatibility
+	// profile used locally when the older wire response omits a scheme.
+	EntryHashSchemeStatementBytes = "statement_bytes"
+)
+
 // CheckpointWitness is capsule-anchor's echoed continuity result.
 type CheckpointWitness struct {
 	LogID     string `json:"log_id"`
@@ -45,7 +57,9 @@ type Receipt struct {
 	EntryHashScheme string
 	LeafIndex       int64
 	TreeSize        int64
-	Checkpoint      CheckpointWitness
+	// Checkpoint is zero only for the omitted-field hosted compatibility
+	// profile, where the receipt proves inclusion but makes no continuity claim.
+	Checkpoint CheckpointWitness
 }
 
 // HTTPError preserves the status used for retry classification.
@@ -140,7 +154,24 @@ func (c *Client) Submit(ctx context.Context, signedStatement []byte) (Receipt, e
 	if err := json.Unmarshal(raw, &wire); err != nil {
 		return Receipt{}, fmt.Errorf("decode anchor response: %w", err)
 	}
-	if wire.EntryHashScheme != "sig_structure" {
+	scheme := wire.EntryHashScheme
+	checkpointWitness := CheckpointWitness{}
+	switch scheme {
+	case EntryHashSchemeSigStructure, EntryHashSchemeLegacy:
+		if wire.Checkpoint == nil {
+			return Receipt{}, fmt.Errorf("checkpoint witness response is required")
+		}
+		checkpointWitness = *wire.Checkpoint
+	case "":
+		// The currently deployed hosted service predates the explicit scheme and
+		// checkpoint-continuity echo. Its documented entry hash is SHA-256 over
+		// the exact statement bytes. Preserve that as an explicit local scheme so
+		// receipt verification cannot silently apply the newer hash rule.
+		if wire.Checkpoint != nil {
+			return Receipt{}, fmt.Errorf("omitted-scheme response must not include checkpoint witness")
+		}
+		scheme = EntryHashSchemeStatementBytes
+	default:
 		return Receipt{}, fmt.Errorf("unsupported entry hash scheme %q", wire.EntryHashScheme)
 	}
 	entryHash, err := hex.DecodeString(wire.EntryHash)
@@ -150,22 +181,21 @@ func (c *Client) Submit(ctx context.Context, signedStatement []byte) (Receipt, e
 	if wire.TreeSize <= 0 || wire.LeafIndex < 0 || wire.LeafIndex >= wire.TreeSize {
 		return Receipt{}, fmt.Errorf("invalid transparency position")
 	}
-	if wire.Checkpoint == nil {
-		return Receipt{}, fmt.Errorf("checkpoint witness response is required")
-	}
-	if wire.Checkpoint.Status != "first-seen" && wire.Checkpoint.Status != "witnessed" && wire.Checkpoint.Status != "already-registered" {
-		return Receipt{}, fmt.Errorf("invalid checkpoint witness status")
-	}
-	if wire.Checkpoint.LogID != claims.LogID || wire.Checkpoint.KeyID != claims.KeyID ||
-		wire.Checkpoint.MMRRoot != claims.MMRRoot || wire.Checkpoint.MMRSize != claims.MMRSize ||
-		wire.Checkpoint.PrevSize != claims.PrevSize || wire.Checkpoint.Timestamp != claims.Timestamp {
-		return Receipt{}, fmt.Errorf("checkpoint witness echo mismatch")
+	if wire.Checkpoint != nil {
+		if checkpointWitness.Status != "first-seen" && checkpointWitness.Status != "witnessed" && checkpointWitness.Status != "already-registered" {
+			return Receipt{}, fmt.Errorf("invalid checkpoint witness status")
+		}
+		if checkpointWitness.LogID != claims.LogID || checkpointWitness.KeyID != claims.KeyID ||
+			checkpointWitness.MMRRoot != claims.MMRRoot || checkpointWitness.MMRSize != claims.MMRSize ||
+			checkpointWitness.PrevSize != claims.PrevSize || checkpointWitness.Timestamp != claims.Timestamp {
+			return Receipt{}, fmt.Errorf("checkpoint witness echo mismatch")
+		}
 	}
 	receiptBytes, err := base64.StdEncoding.Strict().DecodeString(wire.ReceiptB64)
 	if err != nil || len(receiptBytes) == 0 {
 		return Receipt{}, fmt.Errorf("invalid receipt base64")
 	}
-	return Receipt{Bytes: receiptBytes, EntryHash: wire.EntryHash, EntryHashScheme: wire.EntryHashScheme, LeafIndex: wire.LeafIndex, TreeSize: wire.TreeSize, Checkpoint: *wire.Checkpoint}, nil
+	return Receipt{Bytes: receiptBytes, EntryHash: wire.EntryHash, EntryHashScheme: scheme, LeafIndex: wire.LeafIndex, TreeSize: wire.TreeSize, Checkpoint: checkpointWitness}, nil
 }
 
 func boundedText(value string) string {

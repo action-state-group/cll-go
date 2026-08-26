@@ -2,6 +2,7 @@ package capsuleanchor
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strings"
 	"testing"
@@ -60,6 +61,21 @@ func TestDeliveryRunnerVerifiesBeforeCompletion(t *testing.T) {
 	pending, err := store.PendingWitnesses(t.Context(), "anchor", 10)
 	require.NoError(t, err)
 	require.Empty(t, pending)
+}
+
+func TestDeliveryRunnerPersistsInvalidReceiptAsPermanentFailure(t *testing.T) {
+	store := pendingStore(t, "invalid-receipt-log")
+	config := DefaultDeliveryConfig("anchor")
+	runner, err := NewDeliveryRunner(config, store,
+		fakeSubmitter{receipt: Receipt{Bytes: []byte("untrusted")}}, fakeVerifier{err: errors.New("bad authority signature")})
+	require.NoError(t, err)
+	changed, err := runner.RunOnce(t.Context(), time.Now().UTC())
+	require.NoError(t, err)
+	require.True(t, changed)
+	stored, err := store.GetWitness(t.Context(), "anchor", 1)
+	require.NoError(t, err)
+	require.Equal(t, ledger.WitnessPermanentFailure, stored.State)
+	require.ErrorContains(t, errors.New(stored.LastError), "bad authority signature")
 }
 
 func pendingStore(t *testing.T, logID string) *jsonl.Store {

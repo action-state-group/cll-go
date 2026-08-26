@@ -16,7 +16,8 @@ Before reading a peer repository to make a behavioral or compatibility claim:
 2. update the intended ref with `git pull --ff-only` on a clean target branch,
    or `git fetch` plus an explicit `origin/<branch>` read when the worktree is
    on another branch;
-3. record the exact commit used in `findings.md` or the design.
+3. record a compatibility-critical source revision in `DESIGN.md` when that
+   revision is part of the implementation contract.
 
 Peer checkouts normally live beside this repository under `~/GitHub`.
 
@@ -30,8 +31,7 @@ Design and implementation reviews must compare:
 - `capsule-ledger` ledger semantics and current gaps;
 - `capsule-anchor` request, receipt, and witness behavior;
 - the Alchemy investigation publication profile;
-- the Action State Group Slack decisions recorded in `findings.md`;
-- the user decisions captured in `DESIGN.md` and `task_plan.md`.
+- the ownership and integration decisions captured in `DESIGN.md`.
 
 Run the `cross-review` workflow to convergence after the design and again after
 implementation. Peer findings are hypotheses; verify and adjudicate each before
@@ -78,6 +78,8 @@ go test -race ./...
 
 - Use conventional commit prefixes.
 - Sign every commit with `git commit -s` and verify the `Signed-off-by` trailer.
-- Do not commit credentials, `.env`, temporary files, editor state, or generated
-  review scratch outside the explicitly tracked planning files.
+- Do not commit credentials, `.env`, temporary files, editor state, task-local
+  plans, progress logs, review transcripts, or command history. Git, CI, and
+  the task own execution history; `DESIGN.md` and `README.md` own durable
+  contracts and usage guidance.
 - Preserve unrelated user changes.

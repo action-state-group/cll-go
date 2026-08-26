@@ -62,13 +62,23 @@ func EntryHash(statement []byte) ([]byte, error) {
 }
 
 func (v *ReceiptVerifier) Verify(statement []byte, receipt Receipt) error {
-	if receipt.EntryHashScheme != "sig_structure" {
-		return fmt.Errorf("receipt entry hash scheme is not sig_structure")
-	}
 	if len(receipt.Bytes) == 0 || len(receipt.Bytes) > DefaultMaxResponseBytes {
 		return fmt.Errorf("receipt size is invalid")
 	}
-	entry, err := EntryHash(statement)
+	var entry []byte
+	var err error
+	switch receipt.EntryHashScheme {
+	case EntryHashSchemeSigStructure:
+		entry, err = EntryHash(statement)
+	case EntryHashSchemeLegacy, EntryHashSchemeStatementBytes:
+		if len(statement) == 0 || len(statement) > MaxSignedStatementBytes {
+			return fmt.Errorf("signed statement size is invalid")
+		}
+		digest := sha256.Sum256(statement)
+		entry = digest[:]
+	default:
+		return fmt.Errorf("unsupported receipt entry hash scheme %q", receipt.EntryHashScheme)
+	}
 	if err != nil {
 		return err
 	}
