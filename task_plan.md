@@ -104,9 +104,9 @@ Phase 8
 - [x] Run format, tidy, vet, unit, race, integration, and documentation checks.
 - [x] Converge correctness, quality `/simplify`, and cleanup review with every
   available peer; record unavailable peers without blocking.
-- [ ] Commit with DCO sign-off, push `main`, and verify GitHub Actions on the
+- [x] Commit with DCO sign-off, push `main`, and verify GitHub Actions on the
   final remote SHA.
-- **Status:** in_progress
+- **Status:** completed
 
 ## Key Questions
 

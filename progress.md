@@ -4,7 +4,7 @@
 
 ### Phase 8: Public verifier API cleanup and end-to-end example
 
-- **Status:** in_progress
+- **Status:** completed
 - Actions taken:
   - Confirmed `AACVerifier` is the only production implementation of the
     public `Verifier` interface and that no service test uses an injected fake.
@@ -38,6 +38,9 @@
     both test modes. The complete README Go example also passed syntax format
     validation, and the peer ran it end to end against a receipt-minting fake
     anchor.
+  - Pushed DCO-signed implementation commit
+    `75279829e44f3714996c6797c7117a07ecf7dff3`; local and remote `main` matched,
+    and GitHub Actions run `32929741107` passed every required step.
 
 ### Phase 1: Repository bootstrap and source-grounded discovery
 
@@ -175,6 +178,7 @@
 | Final uncached validation | `go test -count=1 ./...` and `go test -race -count=1 ./...` | Every package passes without cache | Every package passed; MySQL Testcontainers passed in both runs | Pass |
 | Remote GitHub Actions | Run `32925890784` on implementation commit `5f3e821` | Required CI passes on the pushed commit | Format, module, vet, ordinary test, race test, and MySQL Testcontainers all passed | Pass |
 | Phase 8 local validation | fmt, tidy, vet, uncached unit and race suites | Every package and real MySQL integration passes | All checks passed; README full Go example passed syntax validation and peer end-to-end execution | Pass |
+| Phase 8 remote GitHub Actions | Run `32929741107` on implementation commit `7527982` | Required CI passes on the pushed commit | Format, module, vet, ordinary test, race test, and MySQL Testcontainers all passed | Pass |
 
 ## Error Log
 
