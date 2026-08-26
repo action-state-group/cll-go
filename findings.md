@@ -200,6 +200,32 @@ and package/CI wording no longer promises nonexistent migration suites.
 | zsh treats lowercase `path` as a special variable tied to `PATH` | Use `repo_dir` or another task-specific name in all repository loops. |
 | `go-datatrails-merklelog` has no root `go.mod` | Locate its nested module boundaries and license before selecting a dependency path. |
 
+## Implementation Cross-Review Adjudication
+
+The driver correctness and simplification passes found and fixed these material
+issues before publication:
+
+1. JSONL CLL validation changed `ForceCheckpoint` before the journal commit;
+   validation is now side-effect free and has a regression test.
+2. Terminal witness outcomes could be overwritten and later checkpoints could
+   leak past continuity conflicts; transitions are now validated and terminal.
+3. Direct Store inputs, identifiers, timestamps, counts, scan sizes, checkpoint
+   sizes, and JSONL event lines needed shared bounds and normalization.
+4. SQLite was missing the MySQL/JSONL not-found behavior for envelope adds;
+   shared contracts now cover it.
+5. Returned JSONL and inserted relational values shared mutable verification
+   maps and finding pointers; model-level deep copies now protect all backends.
+6. Restored MMRs checked hash lengths but not complete size or interior hashes;
+   restore now validates both before use.
+7. Stored checkpoints were extended without revalidating their canonical
+   payload, signature, predecessor, historical root, or leaf cursor; the runner
+   now fails closed on every one of those checks.
+8. MySQL deadlocks and SQLite busy errors were not consistently classified at
+   write-method boundaries; runners now pause and retry typed contention.
+9. The anchor client needed an additive-response policy, URL validation,
+   default request timeout, redirect and response bounds, echo tests, and
+   bounded persisted errors.
+
 ## Resources
 
 - `/Users/ezhang/GitHub/agent-action-capsule`

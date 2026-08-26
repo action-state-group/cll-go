@@ -103,9 +103,18 @@
 
 ### Phase 6: Implementation cross-review and verification
 
-- **Status:** pending
+- **Status:** completed
 - Actions taken:
-  - None.
+  - Completed driver correctness and simplification passes across all packages.
+  - Compared concrete interfaces, AAC decoding, DataTrails MMR behavior,
+    capsule-anchor wire semantics, store parity, crash boundaries, and CI.
+  - Applied persistence, transition, validation, deep-copy, MMR restoration,
+    stored-checkpoint verification, retry classification, and HTTP hardening
+    fixes with same-change tests.
+  - Claude cleanup authentication remained unavailable; Kimi and Bob remained
+    quota-unavailable. All were recorded and skipped without idling.
+  - Forced uncached unit and race runs passed all packages, including real
+    MySQL 8 Testcontainers integration and the shared three-backend contracts.
 
 ### Phase 7: Delivery
 
@@ -121,6 +130,7 @@
 | Go package suite | `go test ./...` | All current packages pass | AAC verifier, checkpoint, MMR, and JSONL store pass | Pass |
 | Initial three-backend contract run | `go test ./...` | Identical Store behavior | Exposed empty-envelope `nil` versus empty-slice mismatch | Fail, fixed |
 | Full local validation before final cleanup | fmt, tidy, vet, unit, MySQL integration | All packages pass | All packages passed, including three Testcontainers suites | Pass |
+| Final uncached validation | `go test -count=1 ./...` and `go test -race -count=1 ./...` | Every package passes without cache | Every package passed; MySQL Testcontainers passed in both runs | Pass |
 
 ## Error Log
 
@@ -141,6 +151,8 @@
 | 2026-08-25 21:33 CDT | Switching Capsule parent parsing to the upstream decoder left its `interface{}` result untyped | 1 | Require an object root before reading `chain`; rerun all packages. |
 | 2026-08-25 21:38 CDT | Final Claude design cleanup could not refresh its expired OAuth session | 1 | Record the reviewer as unavailable and continue the driver verification; do not idle on external models. |
 | 2026-08-25 21:38 CDT | A diagnostic search included Markdown backticks in a shell argument and zsh attempted command substitution | 1 | Repeat such searches with literal-safe quoting and keep shell arguments free of executable substitutions. |
+| 2026-08-25 22:03 CDT | Installed `staticcheck` could not decode Go 1.27 export-data version 4 | 1 | Record the tool-version incompatibility; use Go 1.27 `go vet`, tests, race tests, and manual simplification instead of blocking. |
+| 2026-08-25 22:12 CDT | A shared contract reused an `AddOutcome` variable for an `AppendOutcome` result | 1 | Use a separately typed `appendOutcome` variable and rerun the suite. |
 
 ## 5-Question Reboot Check
 

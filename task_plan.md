@@ -42,8 +42,8 @@ Phase 2
   findings.
 - [x] Run cleanup verification with every available peer until convergence;
   unavailable reviewers were recorded and skipped without idling.
-- [ ] Commit and push the converged design, then verify the remote SHA.
-- **Status:** in_progress
+- [x] Commit and push the converged design, then verify the remote SHA.
+- **Status:** completed
 
 ### Phase 4: Core implementation
 
@@ -70,12 +70,13 @@ Phase 2
 
 ### Phase 6: Implementation cross-review and verification
 
-- [ ] Run full format, tidy, vet, unit, race, integration, and conformance
+- [x] Run full format, tidy, vet, unit, race, integration, and conformance
   validation.
-- [ ] Run the driver's correctness and simplification passes.
-- [ ] Run correctness, quality, Claude `/simplify`, and cleanup verification
-  with every available peer CLI until convergence.
-- [ ] Re-run the full validation suite after accepted review fixes.
+- [x] Run the driver's correctness and simplification passes.
+- [x] Run correctness, quality, Claude `/simplify`, and cleanup verification
+  with every available peer CLI until convergence; unavailable external CLIs
+  were recorded and skipped without idling.
+- [x] Re-run the full validation suite after accepted review fixes.
 - [ ] Verify the required GitHub Actions workflow passes on the pushed commit.
 - **Status:** pending
 
@@ -86,7 +87,7 @@ Phase 2
 - [ ] Commit all intended files with DCO sign-off and conventional commits.
 - [ ] Push the default branch and verify local HEAD equals the remote SHA.
 - [ ] Record final tests, review convergence, limitations, and handoff.
-- **Status:** pending
+- **Status:** in_progress
 
 ## Key Questions
 

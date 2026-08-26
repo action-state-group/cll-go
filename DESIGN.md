@@ -100,8 +100,10 @@ type Auditor interface {
 
 Returned byte slices are defensive copies. `Append` verifies the Capsule and
 all provided envelopes before the durable write. Duplicate input returns the
-stored record after exact-byte comparison. `Get` requires an exact ID; prefix
-lookup is deliberately absent from the integrity API.
+stored record after exact-byte comparison of the Capsule and every supplied
+Envelope. Envelopes added after the original append may be present in that
+stored result and do not make an older append retry conflict. `Get` requires an
+exact ID; prefix lookup is deliberately absent from the integrity API.
 
 `VerificationResult` preserves the upstream `OK`, structured findings,
 severity, numbered check, derived assurance, and recomputed Capsule ID.
@@ -123,6 +125,7 @@ type Store interface {
 
 type Rebaseliner interface {
     Rebaseline(ctx context.Context, in RebaselineInput) (RebaselineRecord, error)
+    Rebaselines(ctx context.Context, limit int) ([]RebaselineRecord, error)
 }
 
 type LogSource interface {
@@ -172,6 +175,7 @@ whose first sequence is not `afterSeq+1` or whose entries are not contiguous.
 type Signer interface {
     KeyID() string
     SignCheckpoint(ctx context.Context, payload []byte) ([]byte, error)
+    VerifyCheckpoint(payload, statement []byte) error
 }
 
 type WitnessClient interface {
@@ -189,7 +193,9 @@ unprotected map is empty, its attached payload is the exact checkpoint JSON,
 and its signature covers the RFC 9052 `Sig_structure` with empty external AAD.
 Private key loading and authorization remain outside the library; a helper
 accepts an already-held Ed25519 key. The helper verifies its own output before
-the checkpoint is committed.
+the checkpoint is committed. On restart, the runner also verifies every stored
+checkpoint signature, canonical payload, predecessor, historical MMR root, and
+cursor-to-leaf-count relationship before extending the log.
 
 ## AAC format-4 verification
 
@@ -204,13 +210,12 @@ because it produces `float64`, breaks JCS recomputation, and bypasses upstream
 float and unsafe-integer guards.
 
 The library vendors the baseline `spec/REGISTRY.md` with BSD-3-Clause
-attribution and embeds a generated parsed map. The map is generated at release
-time by running upstream `registries.Load` over that file, not with a second
-Markdown parser. A test asserts the embedded map equals upstream Load at the
-pinned commit. Runtime always passes a non-nil complete map and never relies on
-the host working directory or `AAC_REGISTRY_PATH`. Caller extensions merge into
-a copy of that baseline. A non-nil empty map is not a valid baseline. An
-informational unknown registry value never becomes an append failure.
+attribution and embeds its parsed map as Go data. A test loads the vendored file
+with upstream `registries.Load` and asserts exact equality with the embedded map
+at the pinned commit. Runtime always passes a non-nil complete map and never
+relies on the host working directory or `AAC_REGISTRY_PATH`. Caller extensions
+merge into a copy of that baseline. A non-nil empty map is not a valid baseline.
+An informational unknown registry value never becomes an append failure.
 
 Append performs Class 1 per-Capsule verification with caller-configurable
 registries. Chain existence changes as later records arrive, so
@@ -224,12 +229,12 @@ The verifier recomputes the Capsule ID. Missing, malformed, mismatched, or
 error-gated records are rejected. Exact input bytes are retained and never
 repaired by re-marshalling. Envelope bytes are also retained exactly.
 
-Conformance tests keep attributed copies of the upstream Capsule corpus and
-eight frozen Producer Envelope cases at the recorded commit. CI never fetches
-mutable test data from the network. Single-Capsule cases run through `Verify`;
-ledger-shaped cases run through `VerifyStore`, including missing-parent and
-concurrent-supersedes findings. Float and unsafe 16-digit integer cases guard
-the exact decode path.
+Conformance tests keep attributed frozen cases from the upstream Capsule corpus
+and all eight Producer Envelope cases at the recorded commit. CI never fetches
+mutable test data from the network. Single-Capsule cases exercise format-4 JCS,
+tampering, canonicalization declarations, float, and unsafe-integer behavior.
+Ledger-shaped cases run through `VerifyStore`, including missing-parent and
+concurrent-supersedes findings.
 
 ## CLL and MMR
 
@@ -308,8 +313,9 @@ Alchemy has no later request traffic.
 
 ### Rebaseline
 
-An anchor 409 requires an explicit operator rebaseline. `Rebaseline`
-atomically:
+An anchor 409 requires an explicit operator rebaseline. The store rejects the
+operation unless a durable `continuity_conflict` witness outcome exists for the
+active log. `Rebaseline` atomically:
 
 1. freezes the old log scope as read-only;
 2. preserves Capsule sequences, IDs, envelopes, MMR nodes, and size;
@@ -323,13 +329,17 @@ scope has no prior checkpoint and forces an immediate first checkpoint with
 checkpoint `first-seen`, while the migration record preserves local
 discontinuity evidence.
 
-The backends physically copy immutable Capsule rows, envelope rows, and MMR
-nodes into the new log scope. They do not copy checkpoint or witness history.
-This preserves sequence and proof availability under the active ID, but
-temporarily doubles the copied ledger and MMR storage. Rebaseline is an
-exceptional operator action, not a routine rollover mechanism.
+The relational backends physically copy immutable Capsule rows, envelope rows,
+and MMR nodes into the new log scope. They do not copy checkpoint or witness
+history. This preserves sequence and proof availability under the active ID,
+but doubles the copied ledger and MMR storage. JSONL instead appends one
+rebaseline event and rebinds the replayed immutable projection without copying
+body events. Rebaseline is an exceptional operator action, not a routine
+rollover mechanism.
 On its next pass, the existing runner recognizes the durable force marker,
 adopts the store's new active log ID, and emits the forced checkpoint.
+`Rebaselines` exposes the bounded durable lineage after restart; the migration
+record is not write-only evidence.
 
 ## Witness REST and trust
 
@@ -456,6 +466,9 @@ schema version 1 and rejects an unknown version; future migrations are deferred.
 
 - Parameterize SQL and bound HTTP bodies, JSONL events, Capsules, Envelopes,
   scan batches, proofs, and operational error text.
+- Use portable identifier syntax, at most 64 Envelopes per Capsule, at most 32
+  witnesses per checkpoint, and microsecond UTC timestamp precision across all
+  three stores.
 - Reject anchor redirects by default.
 - Never log Capsule content, envelopes, receipts, private keys, or credentials.
 - Keep authentication separate from authorization.
@@ -525,5 +538,7 @@ commit's required workflow is green.
 - Assessment Capsules, compiler/engine folds, and AI effectiveness scoring.
 - A separately versioned envelope-association transparency log.
 - Multi-primary JSONL writers or distributed sequence allocation.
+- Ledger pruning or compaction; records and proof material are intentionally
+  append-only, so operators must size and monitor durable storage.
 - Operating a witness, automatic key discovery, or trust-on-first-use.
 - Any claim that anchor independently verified MMR roots or proofs.
