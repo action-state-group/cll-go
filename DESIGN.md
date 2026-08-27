@@ -14,7 +14,7 @@ Alchemy owns its investigation workflow, GitHub publication, application
 profile, MySQL outbox, retries, and signer authorization.
 `capsule-producer-go` constructs Capsules and Producer Envelopes. This library
 verifies and stores their output. `capsule-anchor` is an external Transparency
-Service. It receives signed checkpoint statements; it does not pull records or
+Service. It receives signed checkpoint records; it does not pull records or
 read Alchemy's outbox.
 
 This is Ethan Zhang's Go implementation, aligned with Steven Mih's Slack
@@ -24,17 +24,17 @@ Action State Group.
 
 ## Source baseline
 
-The design was checked against these refreshed `origin/main` commits on
-2026-08-25:
+The initial design was checked against these `origin/main` commits on
+2026-08-25. The checkpoint and witness rows were refreshed on 2026-08-27 for
+the checkpoint-only migration:
 
 | Repository | Commit | Use |
 |---|---|---|
 | `action-state-group/agent-action-capsule` | `7dcef86634355c0d3335b3050b1bc18845716275` | AAC format-4 verifier, JCS Capsule ID, Producer Envelope verifier, vectors |
 | `ethanyzhang/capsule-producer-go` | `cb9de82a792c387e64f39f719221511b3fa27b49` | producer/ledger boundary and Go version |
-| `action-state-group/capsule-emit` | `d0ff0d725d8683a9e8f63c4980fc5fe3d7c5d443` | CLL hashing, cadence, retry, and trust behavior |
+| `action-state-group/capsule-emit` | `ab5434798565ed2058a7faa86a86fb1cf6097521` | direct CheckpointRecord signing body, digest, Ed25519 signature, and offline verification |
 | `action-state-group/capsule-ledger` | `01f2ae6c4e7d54793ed308a624c367e702a8d089` | sequence, chain-gap, and checkpoint persistence behavior |
-| `action-state-group/capsule-anchor` | `452d253c69bc9eb8ddb780347377c2115e6aa166` | current REST and receipt contract |
-| `action-state-group/capsule-anchor` v0.1.1 | `e6ba56e88a9199d09f111061edce357b120a472c` | older hosted response shape and exact-statement entry hash |
+| `action-state-group/capsule-anchor` | `e635ba88e4337bb8b3bffa3582aeb542f140bb90` | checkpoint-only `/v1/checkpoint` request, signature gate, response, and receipt contract |
 | `datatrails/go-datatrails-merklelog` | `275103a34a08e56a376107246e04dc5819cc44cc` | MMRIVER-compatible Go reference and KATs |
 | `action-state-group/scitt-cose` | `36ec13992287a463481d1b00ac2098f032f229b5` | independent Go COSE/receipt verifier and conformance vectors |
 
@@ -181,7 +181,7 @@ type Signer interface {
 
 // capsuleanchor.Submitter
 type Submitter interface {
-    Submit(ctx context.Context, signedStatement []byte) (Receipt, error)
+    Submit(ctx context.Context, signedCheckpoint []byte) (Receipt, error)
 }
 
 // capsuleanchor.Verifier; ReceiptVerifier is its pinned-key implementation.
@@ -190,15 +190,16 @@ type Verifier interface {
 }
 ```
 
-The wire signer emits CBOR tag 18 with exactly four COSE_Sign1 elements. Its
-protected map contains algorithm label `1` with EdDSA value `-8`, its
-unprotected map is empty, its attached payload is the exact checkpoint JSON,
-and its signature covers the RFC 9052 `Sig_structure` with empty external AAD.
-Private key loading and authorization remain outside the library; a helper
-accepts an already-held Ed25519 key. The helper verifies its own output before
-the checkpoint is committed. On restart, the runner also verifies every stored
-checkpoint signature, canonical payload, predecessor, historical MMR root, and
-cursor-to-leaf-count relationship before extending the log.
+The wire signer emits the direct JSON `CheckpointRecord` shared with
+`capsule-emit`. `key_id` is the lowercase hex encoding of the raw Ed25519
+public key. `signature` is Ed25519 over the lowercase hexadecimal SHA-256
+digest of the canonical signature-free body, encoded as ASCII. Private key
+loading and authorization remain outside the library; a helper accepts an
+already-held Ed25519 key and derives `key_id`. The helper verifies its own
+output before the checkpoint is committed. On restart, the runner also
+verifies every stored checkpoint signature, canonical payload, predecessor,
+historical MMR root, and cursor-to-leaf-count relationship before extending
+the log.
 
 ## AAC format-4 verification
 
@@ -273,33 +274,30 @@ a sequence gap.
 
 ## Checkpoints and runner
 
-The anchor-facing payload is a canonical JSON superset of the ratified CLL
-record and the anchor recognition fields:
+The witness-facing payload is the direct canonical JSON `CheckpointRecord`:
 
 ```json
 {
-  "artifact_type": "mmr-checkpoint",
-  "key_id": "<stable signer id>",
+  "key_id": "<raw Ed25519 public key as lowercase hex>",
   "kind": "mmr_checkpoint",
   "log_id": "<non-empty configured id>",
-  "mmr_root": "<64 lowercase hex>",
   "mmr_size": 250,
   "prev_root": "<64 lowercase hex or empty for first>",
   "prev_size": 100,
-  "root": "<same value as mmr_root>",
+  "root": "<64 lowercase hex>",
+  "signature": "<Ed25519 signature as lowercase hex>",
   "timestamp": "2026-08-25T00:00:00Z",
   "v": 1
 }
 ```
 
-`v`, `kind`, `root`, and `prev_root` preserve the Python record shape;
-`artifact_type` and `mmr_root` activate current anchor recognition. Duplicate
-root fields must match. The canonical ratified signing body and digest remain a
-separate persisted projection for Python tooling. The Ed25519 COSE signature
-covers the complete superset payload and is not claimed to interoperate with
-the Python HMAC helper.
+The signature-free projection is persisted as exact canonical payload bytes.
+The complete signed record is persisted separately and matches
+`capsule_emit.checkpoint.emit.CheckpointRecord` byte for byte for the same
+inputs. The signing digest is SHA-256 of the signature-free canonical JSON;
+the signature covers that digest's lowercase hex encoded as ASCII.
 
-The local record also stores exact payload bytes, exact COSE bytes, creation
+The local record stores exact payload bytes, exact signed-record JSON, creation
 time, and witness states. Before signing, the runner recomputes the
 previous root, requires the same log, requires increasing MMR size, and binds
 `prev_size` and local `prev_root` to the prior checkpoint.
@@ -319,9 +317,11 @@ Alchemy has no later request traffic.
 
 ### Rebaseline
 
-An anchor 409 requires an explicit operator rebaseline. The store rejects the
-operation unless a durable `continuity_conflict` witness outcome exists for the
-active log. `Rebaseline` atomically:
+`Rebaseline` remains an explicit operator-only recovery capability for
+independently established log continuity conflicts. The current checkpoint-only
+witness is stateless and does not produce that verdict. The store rejects the
+operation unless the caller has first persisted a durable
+`continuity_conflict` outcome for the active log. `Rebaseline` atomically:
 
 1. freezes the old log scope as read-only;
 2. preserves Capsule sequences, IDs, envelopes, MMR nodes, and size;
@@ -331,8 +331,7 @@ active log. `Rebaseline` atomically:
 
 Checkpoint and witness-delivery history remains under the old log ID. The new
 scope has no prior checkpoint and forces an immediate first checkpoint with
-`prev_size = 0` and empty `prev_root`. The anchor therefore grades that first
-checkpoint `first-seen`, while the migration record preserves local
+`prev_size = 0` and empty `prev_root`. The migration record preserves local
 discontinuity evidence.
 
 The relational backends physically copy immutable Capsule rows, envelope rows,
@@ -352,41 +351,29 @@ record is not write-only evidence.
 The default client calls:
 
 ```text
-POST {baseURL}/transparency/register-statement
+POST {baseURL}/v1/checkpoint
 Content-Type: application/json
-{"signed_statement_b64":"..."}
+<direct CheckpointRecord JSON>
 ```
 
-It accepts bounded current and older-hosted 2xx JSON response profiles. The
-current profile contains `receipt_b64`, `entry_hash`, `entry_hash_scheme`,
-`leaf_index`, `tree_size`, and a non-null `checkpoint_witness`. Echoed fields
-must match the submitted payload, status must be `first-seen`, `witnessed`, or
-`already-registered`, and the scheme must be `sig_structure` or the explicit
-`legacy` value returned by the current migration dual-lookup path. The older
-hosted deployment omits both additive fields and defines `entry_hash` as
-SHA-256 of the exact COSE_Sign1 bytes. The client records that exact older shape
-locally as `statement_bytes`; it never interprets an unknown or ambiguous
-response as compatibility mode. A verified omitted-field compatibility receipt
-proves checkpoint-statement inclusion, not server-side checkpoint continuity.
-
-HTTP 409 is a permanent continuity conflict. Timeouts, 429, and 5xx are
-retryable with capped exponential backoff and jitter. `/v1/digest` is not the
-default because it cannot invoke checkpoint continuity behavior and currently
-misnames a generic digest as `capsule_id` (capsule-anchor issue 27).
+The client accepts one bounded 2xx response profile containing
+`receipt_b64`, `entry_hash`, `entry_hash_scheme`, `leaf_index`, and `tree_size`.
+The deployed checkpoint-only service currently labels its digest registration
+scheme `legacy`; omitted or other schemes fail closed. Timeouts, 429, and 5xx
+are retryable with capped exponential backoff and jitter. Other 4xx responses
+are permanent failures.
 
 Offline receipt verification binds the receipt structure and authority
 signature, caller-pinned Ed25519 authority key, entry hash, submitted signed
-statement, tree coordinates, and inclusion path. The key is configuration,
+checkpoint record, tree coordinates, and inclusion path. The key is configuration,
 not fetched during verification from the server being judged. Rotation is an
 explicit configuration change with an optional declared overlap.
 
-The verifier recomputes `entry_hash` according to the explicit local scheme:
-SHA-256 of the submitted statement's RFC 9052 `Sig_structure` for the current
-profile, or SHA-256 of the exact submitted COSE_Sign1 bytes for an explicit
-`legacy` migration response or omitted-field hosted compatibility. It compares
-the derived value with the response, then uses those bytes for RFC 9162 leaf
-and inclusion-root reconstruction. It never trusts the echoed entry hash as the
-binding source.
+The verifier first validates the checkpoint's self-contained Ed25519
+signature. It recomputes the checkpoint digest from the canonical signing body,
+then computes `entry_hash = SHA256(bytes.fromhex(checkpoint_digest))`. It
+compares that value with the response before RFC 9162 leaf and inclusion-root
+reconstruction. It never trusts the echoed entry hash as the binding source.
 
 The implementation ports the small profile-opaque verifier core from
 `scitt-cose-go-verify` with Apache-2.0 attribution. It uses
@@ -397,18 +384,16 @@ COSE signature. It does not shell out or invoke Python at runtime.
 Each witness has an independent durable delivery row. Pending reads are scoped
 by witness ID and exclude terminal rows, so the limit applies independently to
 each witness. The runner retries that witness's oldest retryable checkpoint
-first and stops its pass on first retryable failure. A
-409 becomes terminal `continuity_conflict`, stops all later delivery for that
-witness and log, and exposes unhealthy state. The runner never skips the
-conflict automatically; recovery uses the explicit Rebaseline operation above.
-A permanent client or receipt-validation failure becomes `permanent_failure`.
+first and stops its pass on first retryable failure. Any non-retryable HTTP or
+receipt-validation failure becomes
+`permanent_failure`.
 The local delivery row becomes `verified` only after offline receipt
-verification. The word `witnessed` is reserved for the anchor's remote status
-value. Per-witness backlog remains visible.
+verification. Per-witness backlog remains visible.
 
-The anchor checks only payload shape and `prev_size` continuity against what it
-last witnessed. It does not verify the producer signature, `prev_root`, MMR
-root, or a consistency proof. Documentation and status must not overstate it.
+The checkpoint-only witness verifies the submitted checkpoint's Ed25519
+signature but is stateless across submissions. It does not verify `prev_root`,
+MMR correctness, or a consistency proof. Documentation and status must not
+overstate it.
 
 ## JSONL storage
 
@@ -444,10 +429,10 @@ MMR node writes are insert-only. A position collision inside a mutation is a
 conflict. The cursor compare-and-swap prevents blind replay of stale CLL
 mutations; callers reload state and recompute after contention. Deadlock and
 lock-timeout failures are retryable. Every row loop checks `rows.Err()`.
-The first release initializes schema version 1 from empty storage and rejects
-an unknown version. There is no prior released schema to migrate; version-to-
-version migration tooling is deliberately deferred. `Close` is idempotent for
-all stores.
+The checkpoint-record migration initializes schema version 2 from empty
+storage and rejects other versions. Version 1 is intentionally unsupported;
+this migration does not retain the old signed-statement storage contract.
+`Close` is idempotent for all stores.
 
 ## SQLite storage
 
@@ -460,7 +445,8 @@ in write transactions that acquire the writer reservation before reading the
 next sequence or CLL cursor. Two-handle tests exercise concurrent allocation.
 SQLite, JSONL, and MySQL run the same data-path contract suite; backend-specific
 tests cover locking, restart, and corruption behavior. SQLite also initializes
-schema version 1 and rejects an unknown version; future migrations are deferred.
+schema version 2 and rejects an unknown version; version 1 is intentionally not
+migrated.
 
 ## Failure and recovery
 
@@ -471,9 +457,9 @@ schema version 1 and rejects an unknown version; future migrations are deferred.
 | Lost notification | Durable cursor scan discovers the Capsule. |
 | Stop during MMR indexing | Atomic CLL mutation is absent or complete; restart resumes. |
 | Stop after checkpoint commit, before network | Pending witness row survives. |
-| Anchor accepted, response lost | Exact statement resubmission is idempotent. |
+| Witness accepted, response lost | Exact checkpoint resubmission is idempotent. |
 | Malformed receipt or unpinned signature | Do not grade witnessed; persist classified failure. |
-| Anchor 409 | Mark permanent continuity conflict; do not skip forward. |
+| Witness 4xx | Mark permanent failure; do not skip forward. |
 | Stop during rebaseline | Migration and rebinding are absent or complete; bindings follow the durable record. |
 | Stored bytes fail verification | Stop the integrity path; never replace bytes. |
 
@@ -484,7 +470,7 @@ schema version 1 and rejects an unknown version; future migrations are deferred.
 - Use portable identifier syntax, at most 64 Envelopes per Capsule, at most 32
   witnesses per checkpoint, and microsecond UTC timestamp precision across all
   three stores.
-- Reject anchor redirects by default.
+- Reject witness redirects by default.
 - Never log Capsule content, envelopes, receipts, private keys, or credentials.
 - Keep authentication separate from authorization.
 - Validate integers before conversion and reject overflow.
@@ -497,8 +483,8 @@ store/jsonl/        JSONL journal backend
 store/sqlite/       embedded SQLite backend
 store/mysql/        MySQL backend
 mmr/                CLL hashing, proofs, DataTrails adapter
-checkpoint/         payload, COSE signer, cadence, runner
-capsuleanchor/      capsule-anchor client and receipt verifier
+checkpoint/         payload, direct JSON signer, cadence, runner
+capsuleanchor/      checkpoint-only witness client and receipt verifier
 internal/storetest/ shared three-backend contract suites
 ledger/testdata/    attributed AAC registry and Capsule vectors
 ```
@@ -533,8 +519,9 @@ commit's required workflow is green.
 3. Python/DataTrails known-answer vectors match roots and proofs, including
    multi-peak and adversarial cases.
 4. Checkpoint signatures and local chain consistency verify after restart.
-5. Fake-anchor tests cover bounds, 409, retry classification, echo checks, and
-   pinned-key receipt validation.
+5. Fake-witness tests cover request shape, bounds, retry classification,
+   response validation, unsupported entry-hash schemes, and pinned-key receipt
+   validation.
 6. Lost-notification and crash-boundary tests demonstrate recovery.
 7. Examples show Alchemy-style append and explicit runner lifecycle.
 8. Local checks and pushed GitHub Actions pass after implementation review.
@@ -546,8 +533,8 @@ commit's required workflow is green.
     JSONL replay enforces the same write-once rule.
 12. One unavailable witness cannot hide or block another witness's pending
     checkpoints.
-13. Rebaseline rejects an existing new log ID and forces a `first-seen`
-    checkpoint with no prior checkpoint fields.
+13. Rebaseline rejects an existing new log ID and forces a checkpoint with no
+    prior checkpoint fields.
 
 ## Deliberately deferred
 
@@ -558,4 +545,4 @@ commit's required workflow is green.
 - Ledger pruning or compaction; records and proof material are intentionally
   append-only, so operators must size and monitor durable storage.
 - Operating a witness, automatic key discovery, or trust-on-first-use.
-- Any claim that anchor independently verified MMR roots or proofs.
+- Any claim that the witness independently verified MMR roots or proofs.

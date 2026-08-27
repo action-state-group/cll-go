@@ -100,20 +100,18 @@ func (r *DeliveryRunner) RunOnce(ctx context.Context, now time.Time) (bool, erro
 	if !item.NextAttemptAt.IsZero() && now.Before(item.NextAttemptAt) {
 		return false, nil
 	}
-	receipt, submitErr := r.client.Submit(ctx, item.Checkpoint.SignedStatement)
+	receipt, submitErr := r.client.Submit(ctx, item.Checkpoint.SignedCheckpoint)
 	if submitErr != nil {
 		state := ledger.WitnessPermanentFailure
 		next := time.Time{}
-		if IsContinuityConflict(submitErr) {
-			state = ledger.WitnessContinuityConflict
-		} else if IsRetryable(submitErr) {
+		if IsRetryable(submitErr) {
 			state = ledger.WitnessRetryable
 			next = now.Add(r.backoff(item.Attempts))
 		}
 		result := ledger.WitnessResult{WitnessID: r.config.WitnessID, MMRSize: item.Checkpoint.MMRSize, State: state, AttemptedAt: now, NextAttemptAt: next, Error: boundedText(submitErr.Error())}
 		return true, r.store.CommitWitness(ctx, result)
 	}
-	if err := r.verifier.Verify(item.Checkpoint.SignedStatement, receipt); err != nil {
+	if err := r.verifier.Verify(item.Checkpoint.SignedCheckpoint, receipt); err != nil {
 		return true, r.store.CommitWitness(ctx, ledger.WitnessResult{WitnessID: r.config.WitnessID, MMRSize: item.Checkpoint.MMRSize, State: ledger.WitnessPermanentFailure, AttemptedAt: now, Error: boundedText(err.Error())})
 	}
 	raw, err := json.Marshal(receipt)

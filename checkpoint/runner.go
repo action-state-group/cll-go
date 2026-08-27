@@ -177,7 +177,7 @@ func (r *Runner) RunOnce(ctx context.Context, now time.Time) (bool, error) {
 		if err != nil {
 			return false, err
 		}
-		cp = &ledger.CheckpointRecord{IndexedSeq: indexed, MMRSize: tree.Size(), Root: payload.Root, Payload: body, SignedStatement: statement, CreatedAt: now.UTC()}
+		cp = &ledger.CheckpointRecord{IndexedSeq: indexed, MMRSize: tree.Size(), Root: payload.Root, Payload: body, SignedCheckpoint: statement, CreatedAt: now.UTC()}
 		firstUncheckpointed = time.Time{}
 	}
 	if len(entries) == 0 && cp == nil {
@@ -217,7 +217,7 @@ func (r *Runner) verifyCheckpoints(state ledger.CLLState, nodes [][]byte) error 
 		} else if payload.PrevSize != previous.MMRSize || payload.PrevRoot != previous.Root {
 			return fmt.Errorf("%w: checkpoint predecessor mismatch", ledger.ErrCorrupt)
 		}
-		if err := r.signer.VerifyCheckpoint(checkpoint.Payload, checkpoint.SignedStatement); err != nil {
+		if err := r.signer.VerifyCheckpoint(checkpoint.Payload, checkpoint.SignedCheckpoint); err != nil {
 			return fmt.Errorf("%w: stored checkpoint signature: %v", ledger.ErrCorrupt, err)
 		}
 		previous = checkpoint

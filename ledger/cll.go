@@ -15,12 +15,12 @@ type MMRNode struct {
 
 // CheckpointRecord preserves exact signed checkpoint bytes.
 type CheckpointRecord struct {
-	IndexedSeq      uint64    `json:"indexed_seq"`
-	MMRSize         uint64    `json:"mmr_size"`
-	Root            string    `json:"root"`
-	Payload         []byte    `json:"payload"`
-	SignedStatement []byte    `json:"signed_statement"`
-	CreatedAt       time.Time `json:"created_at"`
+	IndexedSeq       uint64    `json:"indexed_seq"`
+	MMRSize          uint64    `json:"mmr_size"`
+	Root             string    `json:"root"`
+	Payload          []byte    `json:"payload"`
+	SignedCheckpoint []byte    `json:"signed_checkpoint"`
+	CreatedAt        time.Time `json:"created_at"`
 }
 
 // CLLState is the complete restartable state for one active log.
@@ -72,7 +72,7 @@ func (m CLLMutation) Validate() error {
 	}
 	cp := m.Checkpoint
 	root, err := hex.DecodeString(cp.Root)
-	if cp.MMRSize == 0 || cp.IndexedSeq != m.IndexedSeq || err != nil || len(root) != 32 || hex.EncodeToString(root) != cp.Root || len(cp.Payload) == 0 || len(cp.Payload) > MaxCheckpointPayloadBytes || len(cp.SignedStatement) == 0 || len(cp.SignedStatement) > MaxSignedCheckpointBytes || cp.CreatedAt.IsZero() || !m.FirstUncheckpointed.IsZero() {
+	if cp.MMRSize == 0 || cp.IndexedSeq != m.IndexedSeq || err != nil || len(root) != 32 || hex.EncodeToString(root) != cp.Root || len(cp.Payload) == 0 || len(cp.Payload) > MaxCheckpointPayloadBytes || len(cp.SignedCheckpoint) == 0 || len(cp.SignedCheckpoint) > MaxSignedCheckpointBytes || cp.CreatedAt.IsZero() || !m.FirstUncheckpointed.IsZero() {
 		return fmt.Errorf("%w: invalid checkpoint mutation", ErrInvalid)
 	}
 	seen := make(map[string]struct{}, len(m.WitnessIDs))

@@ -24,7 +24,7 @@ type fakeVerifier struct{ err error }
 
 func (f fakeVerifier) Verify([]byte, Receipt) error { return f.err }
 
-func TestDeliveryRunnerPersistsRetryAndContinuityStates(t *testing.T) {
+func TestDeliveryRunnerPersistsRetryAndPermanentFailureStates(t *testing.T) {
 	store := pendingStore(t, "delivery-log")
 	config := DefaultDeliveryConfig("anchor")
 	config.Jitter = false
@@ -48,6 +48,9 @@ func TestDeliveryRunnerPersistsRetryAndContinuityStates(t *testing.T) {
 	pending, err = store.PendingWitnesses(t.Context(), "anchor", 10)
 	require.NoError(t, err)
 	require.Empty(t, pending)
+	stored, err := store.GetWitness(t.Context(), "anchor", 1)
+	require.NoError(t, err)
+	require.Equal(t, ledger.WitnessPermanentFailure, stored.State)
 }
 
 func TestDeliveryRunnerVerifiesBeforeCompletion(t *testing.T) {
@@ -83,7 +86,7 @@ func pendingStore(t *testing.T, logID string) *jsonl.Store {
 	store, err := jsonl.Open(t.TempDir(), logID)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, store.Close()) })
-	cp := ledger.CheckpointRecord{IndexedSeq: 1, MMRSize: 1, Root: strings.Repeat("0", 64), Payload: []byte("payload"), SignedStatement: []byte("statement"), CreatedAt: time.Now().UTC()}
+	cp := ledger.CheckpointRecord{IndexedSeq: 1, MMRSize: 1, Root: strings.Repeat("0", 64), Payload: []byte("payload"), SignedCheckpoint: []byte("statement"), CreatedAt: time.Now().UTC()}
 	err = store.CommitCLL(t.Context(), ledger.CLLMutation{ExpectedIndexedSeq: 0, IndexedSeq: 1, Nodes: []ledger.MMRNode{{Position: 0, Hash: make([]byte, 32)}}, Checkpoint: &cp, WitnessIDs: []string{"anchor"}})
 	require.NoError(t, err)
 	return store

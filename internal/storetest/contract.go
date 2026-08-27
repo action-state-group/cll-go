@@ -154,7 +154,7 @@ func RunCLL(t *testing.T, open CLLFactory) {
 	t.Helper()
 	store := open(t, "contract-cll")
 	created := time.Date(2026, 8, 25, 3, 0, 0, 0, time.UTC)
-	cp := ledger.CheckpointRecord{IndexedSeq: 1, MMRSize: 1, Root: fmt.Sprintf("%064x", 1), Payload: []byte("payload"), SignedStatement: []byte("statement"), CreatedAt: created}
+	cp := ledger.CheckpointRecord{IndexedSeq: 1, MMRSize: 1, Root: fmt.Sprintf("%064x", 1), Payload: []byte("payload"), SignedCheckpoint: []byte("statement"), CreatedAt: created}
 	err := store.CommitCLL(t.Context(), ledger.CLLMutation{ExpectedIndexedSeq: 0, IndexedSeq: 1, Nodes: []ledger.MMRNode{{Position: 0, Hash: make([]byte, 32)}}, Checkpoint: &cp, WitnessIDs: []string{"a", "b"}})
 	require.NoError(t, err)
 	state, err := store.LoadCLL(t.Context())
@@ -185,7 +185,7 @@ func RunCLL(t *testing.T, open CLLFactory) {
 	pending, err = store.PendingWitnesses(t.Context(), "b", 10)
 	require.NoError(t, err)
 	require.Len(t, pending, 1)
-	secondCheckpoint := ledger.CheckpointRecord{IndexedSeq: 2, MMRSize: 3, Root: fmt.Sprintf("%064x", 2), Payload: []byte("payload-2"), SignedStatement: []byte("statement-2"), CreatedAt: created.Add(time.Minute)}
+	secondCheckpoint := ledger.CheckpointRecord{IndexedSeq: 2, MMRSize: 3, Root: fmt.Sprintf("%064x", 2), Payload: []byte("payload-2"), SignedCheckpoint: []byte("statement-2"), CreatedAt: created.Add(time.Minute)}
 	require.NoError(t, store.CommitCLL(t.Context(), ledger.CLLMutation{ExpectedIndexedSeq: 1, IndexedSeq: 2, Nodes: []ledger.MMRNode{{Position: 1, Hash: make([]byte, 32)}, {Position: 2, Hash: make([]byte, 32)}}, Checkpoint: &secondCheckpoint, WitnessIDs: []string{"b"}}))
 	require.NoError(t, store.CommitWitness(t.Context(), ledger.WitnessResult{WitnessID: "b", MMRSize: 1, State: ledger.WitnessContinuityConflict, Error: "fork", AttemptedAt: created}))
 	pending, err = store.PendingWitnesses(t.Context(), "b", 10)
@@ -201,7 +201,7 @@ func RunRebaseline(t *testing.T, open RebaselineFactory) {
 	input := appendInput(1)
 	_, _, err := store.Append(t.Context(), input)
 	require.NoError(t, err)
-	cp := ledger.CheckpointRecord{IndexedSeq: 1, MMRSize: 1, Root: fmt.Sprintf("%064x", 1), Payload: []byte("payload"), SignedStatement: []byte("statement"), CreatedAt: input.AppendedAt}
+	cp := ledger.CheckpointRecord{IndexedSeq: 1, MMRSize: 1, Root: fmt.Sprintf("%064x", 1), Payload: []byte("payload"), SignedCheckpoint: []byte("statement"), CreatedAt: input.AppendedAt}
 	require.NoError(t, store.CommitCLL(t.Context(), ledger.CLLMutation{ExpectedIndexedSeq: 0, IndexedSeq: 1, Nodes: []ledger.MMRNode{{Position: 0, Hash: make([]byte, 32)}}, Checkpoint: &cp, WitnessIDs: []string{"anchor", "anchor-conflict"}}))
 	require.NoError(t, store.CommitWitness(t.Context(), ledger.WitnessResult{WitnessID: "anchor", MMRSize: 1, State: ledger.WitnessVerified, Receipt: []byte("receipt"), AttemptedAt: input.AppendedAt}))
 	require.NoError(t, store.CommitWitness(t.Context(), ledger.WitnessResult{WitnessID: "anchor-conflict", MMRSize: 1, State: ledger.WitnessContinuityConflict, Error: "fork", AttemptedAt: input.AppendedAt}))

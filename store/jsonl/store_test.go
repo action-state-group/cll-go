@@ -31,7 +31,7 @@ func TestCLLValidationHasNoStateEffectsBeforeJournalCommit(t *testing.T) {
 	mutation := ledger.CLLMutation{
 		IndexedSeq: 1,
 		Nodes:      []ledger.MMRNode{{Position: 0, Hash: make([]byte, 32)}},
-		Checkpoint: &ledger.CheckpointRecord{IndexedSeq: 1, MMRSize: 1, Root: fmt.Sprintf("%064x", 1), Payload: []byte("payload"), SignedStatement: []byte("statement"), CreatedAt: time.Now().UTC()},
+		Checkpoint: &ledger.CheckpointRecord{IndexedSeq: 1, MMRSize: 1, Root: fmt.Sprintf("%064x", 1), Payload: []byte("payload"), SignedCheckpoint: []byte("statement"), CreatedAt: time.Now().UTC()},
 	}
 	require.NoError(t, store.validateCLL(mutation))
 	require.True(t, store.cll.ForceCheckpoint)
@@ -150,6 +150,16 @@ func TestStoreTruncatesUnterminatedTailButRejectsEarlierCorruption(t *testing.T)
 	require.Nil(t, failed)
 }
 
+func TestOpenRejectsVersionOneJournal(t *testing.T) {
+	root := t.TempDir()
+	record := []byte("{\"version\":1,\"type\":\"log.init\",\"log_id\":\"test-log\"}\n")
+	require.NoError(t, os.WriteFile(filepath.Join(root, journalName), record, 0o600))
+
+	store, err := Open(root, "test-log")
+	require.ErrorIs(t, err, ledger.ErrCorrupt)
+	require.Nil(t, store)
+}
+
 func TestStoreHonorsCanceledContext(t *testing.T) {
 	store, err := Open(t.TempDir(), "test-log")
 	require.NoError(t, err)
@@ -165,7 +175,7 @@ func TestStorePersistsCLLAndWitnessState(t *testing.T) {
 	store, err := Open(root, "test-log")
 	require.NoError(t, err)
 	created := time.Date(2026, 8, 25, 2, 0, 0, 0, time.UTC)
-	checkpoint := ledger.CheckpointRecord{IndexedSeq: 1, MMRSize: 1, Root: fmt.Sprintf("%064x", 1), Payload: []byte("payload"), SignedStatement: []byte("statement"), CreatedAt: created}
+	checkpoint := ledger.CheckpointRecord{IndexedSeq: 1, MMRSize: 1, Root: fmt.Sprintf("%064x", 1), Payload: []byte("payload"), SignedCheckpoint: []byte("statement"), CreatedAt: created}
 	err = store.CommitCLL(t.Context(), ledger.CLLMutation{
 		ExpectedIndexedSeq: 0, IndexedSeq: 1,
 		Nodes:      []ledger.MMRNode{{Position: 0, Hash: make([]byte, 32)}},
@@ -201,7 +211,7 @@ func TestStoreRebaselineRebindsJournal(t *testing.T) {
 	created := time.Now().UTC()
 	_, _, err = store.Append(t.Context(), ledger.AppendInput{CapsuleID: testID, Capsule: []byte("capsule"), AppendedAt: created})
 	require.NoError(t, err)
-	checkpoint := ledger.CheckpointRecord{IndexedSeq: 1, MMRSize: 1, Root: fmt.Sprintf("%064x", 1), Payload: []byte("payload"), SignedStatement: []byte("statement"), CreatedAt: created}
+	checkpoint := ledger.CheckpointRecord{IndexedSeq: 1, MMRSize: 1, Root: fmt.Sprintf("%064x", 1), Payload: []byte("payload"), SignedCheckpoint: []byte("statement"), CreatedAt: created}
 	require.NoError(t, store.CommitCLL(t.Context(), ledger.CLLMutation{IndexedSeq: 1, Nodes: []ledger.MMRNode{{Position: 0, Hash: make([]byte, 32)}}, Checkpoint: &checkpoint, WitnessIDs: []string{"anchor"}}))
 	require.NoError(t, store.CommitWitness(t.Context(), ledger.WitnessResult{WitnessID: "anchor", MMRSize: 1, State: ledger.WitnessContinuityConflict, Error: "fork", AttemptedAt: created}))
 	_, err = store.Rebaseline(t.Context(), ledger.RebaselineInput{NewLogID: "new-log", Reason: "anchor continuity conflict", At: time.Now().UTC(), MigrationID: "migration-1"})

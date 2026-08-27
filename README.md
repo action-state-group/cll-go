@@ -12,8 +12,8 @@ It provides:
   verification;
 - conformance with the current AAC v4, Python CLL, and capsule-anchor contracts;
 - explicit checkpoint and witness runners whose lifecycle belongs to the host;
-- signed Ed25519 COSE checkpoints;
-- a bounded capsule-anchor REST client;
+- signed Ed25519 checkpoint records interoperable with `capsule-emit`;
+- a bounded checkpoint-only witness REST client;
 - offline RFC 9162 receipt verification under a pinned authority key.
 
 The CLL commits ordered Capsule IDs. Producer Envelopes remain independently
@@ -45,13 +45,13 @@ tested against a real MySQL 8 container.
 ## End-to-end: Producer to Ledger to Witness
 
 The producer key signs one independent Producer Envelope. The checkpoint key
-signs the local CLL checkpoint. The pinned anchor authority public key verifies
+signs the local CLL checkpoint. The pinned witness authority public key verifies
 the external service's receipt. These are three separate trust roles, and the
 host must provision and authorize their keys outside this library.
 
 This synchronous example sets the checkpoint cadence to one Capsule so the
-whole path is visible in one call. `anchorBaseURL` identifies an already-running
-external `capsule-anchor`; this library does not start an anchor service.
+whole path is visible in one call. `witnessBaseURL` identifies an already-running
+checkpoint-only `capsule-anchor` deployment; this library does not start it.
 
 ```go
 package integration
@@ -65,23 +65,23 @@ import (
 
     producer "github.com/ethanyzhang/capsule-producer-go"
 
+    "github.com/ethanyzhang/capsule-ledger-go/capsuleanchor"
     "github.com/ethanyzhang/capsule-ledger-go/checkpoint"
     "github.com/ethanyzhang/capsule-ledger-go/ledger"
     "github.com/ethanyzhang/capsule-ledger-go/store/sqlite"
-    "github.com/ethanyzhang/capsule-ledger-go/capsuleanchor"
 )
 
 func PublishInvestigation(
     ctx context.Context,
     databasePath string,
-    anchorBaseURL string,
+    witnessBaseURL string,
     producerPrivateKey ed25519.PrivateKey,
     checkpointPrivateKey ed25519.PrivateKey,
-    anchorAuthorityPublicKey ed25519.PublicKey,
+    witnessAuthorityPublicKey ed25519.PublicKey,
 ) (finalErr error) {
     const (
         logID     = "alchemy-investigations-prod"
-        witnessID = "production-anchor"
+        witnessID = "production-checkpoint-witness"
     )
 
     // Open one durable ledger stream. Reuse logID across process restarts.
@@ -135,10 +135,7 @@ func PublishInvestigation(
 
     // Read new Capsule IDs from the same Store, advance the CLL/MMR, sign a
     // checkpoint, and atomically create its pending witness-delivery row.
-    checkpointSigner, err := checkpoint.NewEd25519Signer(
-        "alchemy-checkpoint-key-1",
-        checkpointPrivateKey,
-    )
+    checkpointSigner, err := checkpoint.NewEd25519Signer(checkpointPrivateKey)
     if err != nil {
         return err
     }
@@ -161,20 +158,20 @@ func PublishInvestigation(
         return fmt.Errorf("checkpoint runner made no progress")
     }
 
-    // POST the signed checkpoint to the external anchor and verify its receipt
+    // POST the signed checkpoint to the external witness and verify its receipt
     // locally under trust material provisioned independently of that server.
-    anchorClient, err := capsuleanchor.NewClient(anchorBaseURL, nil, 0)
+    witnessClient, err := capsuleanchor.NewClient(witnessBaseURL, nil, 0)
     if err != nil {
         return err
     }
-    receiptVerifier, err := capsuleanchor.NewReceiptVerifier(anchorAuthorityPublicKey)
+    receiptVerifier, err := capsuleanchor.NewReceiptVerifier(witnessAuthorityPublicKey)
     if err != nil {
         return err
     }
     deliveryRunner, err := capsuleanchor.NewDeliveryRunner(
         capsuleanchor.DefaultDeliveryConfig(witnessID),
         store,
-        anchorClient,
+        witnessClient,
         receiptVerifier,
     )
     if err != nil {
@@ -217,16 +214,17 @@ ledger.Service.Append
 checkpoint.Runner.RunOnce
     -> durable CLL/MMR checkpoint + pending delivery
 capsuleanchor.DeliveryRunner.RunOnce
-    -> POST /transparency/register-statement
+    -> POST /v1/checkpoint
     -> offline receipt verification
     -> durable verified witness result
 ```
 
-The client supports both current and older hosted `capsule-anchor` responses.
-An older receipt proves checkpoint inclusion but makes no server-side
-continuity claim. Unknown or ambiguous response shapes fail closed. See the
-[witness contract](DESIGN.md#witness-rest-and-trust) for the exact profiles and
-hash rules.
+The client accepts only the deployed checkpoint-only request and response
+profile. The witness verifies the checkpoint's self-contained Ed25519
+signature and returns an RFC 9162 receipt. It is stateless across checkpoints,
+so the receipt proves checkpoint registration and time, not stream continuity.
+See the [witness contract](DESIGN.md#witness-rest-and-trust) for the exact hash
+rules.
 
 In a long-running Alchemy server, construct these objects once during startup
 and run `checkpointRunner.Run(serverContext)` and

@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"fmt"
 
+	"github.com/ethanyzhang/capsule-ledger-go/checkpoint"
 	"github.com/fxamacker/cbor/v2"
 	"github.com/veraison/go-cose"
 )
@@ -33,57 +34,26 @@ func NewReceiptVerifier(public ed25519.PublicKey) (*ReceiptVerifier, error) {
 	return &ReceiptVerifier{public: append(ed25519.PublicKey(nil), public...)}, nil
 }
 
-// EntryHash derives capsule-anchor's malleability-resistant Sig_structure hash.
-func EntryHash(statement []byte) ([]byte, error) {
-	if len(statement) == 0 || len(statement) > MaxSignedStatementBytes {
-		return nil, fmt.Errorf("signed statement size is invalid")
-	}
-	var message cose.Sign1Message
-	if err := message.UnmarshalCBOR(statement); err != nil {
-		return nil, fmt.Errorf("decode signed statement: %w", err)
-	}
-	if message.Payload == nil {
-		return nil, fmt.Errorf("signed statement payload must be embedded")
-	}
-	protected, err := message.Headers.MarshalProtected()
-	if err != nil {
-		return nil, err
-	}
-	mode, err := cbor.CanonicalEncOptions().EncMode()
-	if err != nil {
-		return nil, err
-	}
-	structure, err := mode.Marshal([]any{"Signature1", protected, []byte{}, message.Payload})
-	if err != nil {
-		return nil, err
-	}
-	sum := sha256.Sum256(structure)
-	return sum[:], nil
-}
-
 func (v *ReceiptVerifier) Verify(statement []byte, receipt Receipt) error {
 	if len(receipt.Bytes) == 0 || len(receipt.Bytes) > DefaultMaxResponseBytes {
 		return fmt.Errorf("receipt size is invalid")
 	}
-	var entry []byte
-	var err error
-	switch receipt.EntryHashScheme {
-	case EntryHashSchemeSigStructure:
-		entry, err = EntryHash(statement)
-	case EntryHashSchemeLegacy, EntryHashSchemeStatementBytes:
-		if len(statement) == 0 || len(statement) > MaxSignedStatementBytes {
-			return fmt.Errorf("signed statement size is invalid")
-		}
-		digest := sha256.Sum256(statement)
-		entry = digest[:]
-	default:
+	if receipt.EntryHashScheme != EntryHashSchemeCheckpointDigest {
 		return fmt.Errorf("unsupported receipt entry hash scheme %q", receipt.EntryHashScheme)
 	}
+	record, err := checkpoint.ParseRecord(statement)
+	if err != nil {
+		return err
+	}
+	if err := record.VerifySignature(); err != nil {
+		return err
+	}
+	entry, err := record.EntryHash()
 	if err != nil {
 		return err
 	}
 	if hex.EncodeToString(entry) != receipt.EntryHash {
-		return fmt.Errorf("entry hash does not bind signed statement")
+		return fmt.Errorf("entry hash does not bind signed checkpoint")
 	}
 	var message cose.Sign1Message
 	if err := message.UnmarshalCBOR(receipt.Bytes); err != nil {

@@ -31,7 +31,7 @@ func TestRunnerCreatesDurableCheckpointAtEntryCadence(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, uint64(2), state.IndexedSeq)
 	require.Len(t, state.Checkpoints, 1)
-	require.NoError(t, signer.VerifyCheckpoint(state.Checkpoints[0].Payload, state.Checkpoints[0].SignedStatement))
+	require.NoError(t, signer.VerifyCheckpoint(state.Checkpoints[0].Payload, state.Checkpoints[0].SignedCheckpoint))
 	pending, err := store.PendingWitnesses(t.Context(), "anchor", 10)
 	require.NoError(t, err)
 	require.Len(t, pending, 1)
@@ -115,7 +115,7 @@ type tamperedCheckpointStore struct{ ledger.CheckpointStore }
 func (s tamperedCheckpointStore) LoadCLL(ctx context.Context) (ledger.CLLState, error) {
 	state, err := s.CheckpointStore.LoadCLL(ctx)
 	if err == nil && len(state.Checkpoints) > 0 {
-		state.Checkpoints[0].SignedStatement[0] ^= 1
+		state.Checkpoints[0].SignedCheckpoint[0] ^= 1
 	}
 	return state, err
 }
@@ -127,7 +127,7 @@ func runnerFixture(t *testing.T, logID string) (*jsonl.Store, *checkpoint.Ed2551
 	t.Cleanup(func() { require.NoError(t, store.Close()) })
 	_, private, err := ed25519.GenerateKey(rand.Reader)
 	require.NoError(t, err)
-	signer, err := checkpoint.NewEd25519Signer("test-key", private)
+	signer, err := checkpoint.NewEd25519Signer(private)
 	require.NoError(t, err)
 	return store, signer
 }

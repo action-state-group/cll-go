@@ -121,7 +121,7 @@ func TestStoreLifecycleAndLogIsolation(t *testing.T) {
 	require.ErrorIs(t, err, ledger.ErrNotFound)
 }
 
-func TestOpenRejectsUnknownSchemaVersion(t *testing.T) {
+func TestOpenRejectsVersionOneSchema(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "version.db")
 	store, err := Open(path, "versioned")
 	require.NoError(t, err)
@@ -129,7 +129,7 @@ func TestOpenRejectsUnknownSchemaVersion(t *testing.T) {
 
 	db, err := sql.Open("sqlite", path)
 	require.NoError(t, err)
-	_, err = db.Exec(`UPDATE schema_metadata SET version=2 WHERE singleton=1`)
+	_, err = db.Exec(`UPDATE schema_metadata SET version=1 WHERE singleton=1`)
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 

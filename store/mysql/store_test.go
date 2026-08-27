@@ -89,7 +89,7 @@ func TestStoreLifecycleAndLogIsolation(t *testing.T) {
 
 	db, err := sql.Open("mysql", dsn)
 	require.NoError(t, err)
-	_, err = db.ExecContext(t.Context(), `UPDATE schema_metadata SET version=2 WHERE singleton=1`)
+	_, err = db.ExecContext(t.Context(), `UPDATE schema_metadata SET version=1 WHERE singleton=1`)
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 	_, err = Open(t.Context(), dsn, "first")

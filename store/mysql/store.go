@@ -16,6 +16,8 @@ import (
 	mysqlDriver "github.com/go-sql-driver/mysql"
 )
 
+const schemaVersion = 2
+
 const schema = `
 CREATE TABLE IF NOT EXISTS schema_metadata (
   singleton TINYINT UNSIGNED PRIMARY KEY,
@@ -60,7 +62,7 @@ CREATE TABLE IF NOT EXISTS mmr_nodes (
 ) ENGINE=InnoDB;
 CREATE TABLE IF NOT EXISTS checkpoints (
   log_id VARCHAR(191) NOT NULL, mmr_size BIGINT UNSIGNED NOT NULL, indexed_seq BIGINT UNSIGNED NOT NULL,
-  root CHAR(64) NOT NULL, payload BLOB NOT NULL, signed_statement BLOB NOT NULL, created_at DATETIME(6) NOT NULL,
+  root CHAR(64) NOT NULL, payload BLOB NOT NULL, signed_checkpoint BLOB NOT NULL, created_at DATETIME(6) NOT NULL,
   PRIMARY KEY (log_id, mmr_size), CONSTRAINT checkpoints_log FOREIGN KEY (log_id) REFERENCES ledger_metadata(log_id)
 ) ENGINE=InnoDB;
 CREATE TABLE IF NOT EXISTS witness_deliveries (
@@ -108,11 +110,11 @@ func Open(ctx context.Context, dsn, logID string) (*Store, error) {
 	if _, err := db.ExecContext(ctx, schema); err != nil {
 		return nil, errors.Join(fmt.Errorf("initialize MySQL store: %w", err), db.Close())
 	}
-	if _, err := db.ExecContext(ctx, `INSERT INTO schema_metadata(singleton,version) VALUES(1,1) ON DUPLICATE KEY UPDATE singleton=VALUES(singleton)`); err != nil {
+	if _, err := db.ExecContext(ctx, `INSERT INTO schema_metadata(singleton,version) VALUES(1,?) ON DUPLICATE KEY UPDATE singleton=VALUES(singleton)`, schemaVersion); err != nil {
 		return nil, errors.Join(fmt.Errorf("initialize MySQL schema version: %w", err), db.Close())
 	}
 	var version uint64
-	if err := db.QueryRowContext(ctx, `SELECT version FROM schema_metadata WHERE singleton=1`).Scan(&version); err != nil || version != 1 {
+	if err := db.QueryRowContext(ctx, `SELECT version FROM schema_metadata WHERE singleton=1`).Scan(&version); err != nil || version != schemaVersion {
 		return nil, errors.Join(fmt.Errorf("unsupported MySQL schema version %d: %w", version, ledger.ErrCorrupt), err, db.Close())
 	}
 	if _, err := db.ExecContext(ctx, `INSERT INTO ledger_metadata(log_id,next_seq) VALUES(?,1) ON DUPLICATE KEY UPDATE log_id=VALUES(log_id)`, logID); err != nil {
@@ -423,14 +425,14 @@ func (s *Store) LoadCLL(ctx context.Context) (ledger.CLLState, error) {
 	if err := rows.Close(); err != nil {
 		return ledger.CLLState{}, err
 	}
-	rows, err = s.db.QueryContext(ctx, `SELECT indexed_seq,mmr_size,root,payload,signed_statement,created_at FROM checkpoints WHERE log_id=? ORDER BY mmr_size`, s.logID)
+	rows, err = s.db.QueryContext(ctx, `SELECT indexed_seq,mmr_size,root,payload,signed_checkpoint,created_at FROM checkpoints WHERE log_id=? ORDER BY mmr_size`, s.logID)
 	if err != nil {
 		return ledger.CLLState{}, err
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var cp ledger.CheckpointRecord
-		if err := rows.Scan(&cp.IndexedSeq, &cp.MMRSize, &cp.Root, &cp.Payload, &cp.SignedStatement, &cp.CreatedAt); err != nil {
+		if err := rows.Scan(&cp.IndexedSeq, &cp.MMRSize, &cp.Root, &cp.Payload, &cp.SignedCheckpoint, &cp.CreatedAt); err != nil {
 			return ledger.CLLState{}, err
 		}
 		cp.CreatedAt = cp.CreatedAt.UTC()
@@ -499,7 +501,7 @@ func (s *Store) CommitCLL(ctx context.Context, mutation ledger.CLLMutation) (fin
 		if cp.MMRSize != count+uint64(len(mutation.Nodes)) {
 			return ledger.ErrInvalid
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO checkpoints(log_id,mmr_size,indexed_seq,root,payload,signed_statement,created_at) VALUES(?,?,?,?,?,?,?)`, s.logID, cp.MMRSize, cp.IndexedSeq, cp.Root, cp.Payload, cp.SignedStatement, cp.CreatedAt.UTC()); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO checkpoints(log_id,mmr_size,indexed_seq,root,payload,signed_checkpoint,created_at) VALUES(?,?,?,?,?,?,?)`, s.logID, cp.MMRSize, cp.IndexedSeq, cp.Root, cp.Payload, cp.SignedCheckpoint, cp.CreatedAt.UTC()); err != nil {
 			return err
 		}
 		for _, id := range mutation.WitnessIDs {
@@ -520,7 +522,7 @@ func (s *Store) PendingWitnesses(ctx context.Context, witnessID string, limit in
 	if ledger.ValidateIdentifier(witnessID) != nil || limit <= 0 || limit > ledger.MaxScanLimit {
 		return nil, ledger.ErrInvalid
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT d.state,d.attempts,d.next_attempt_at,d.last_error,c.indexed_seq,c.mmr_size,c.root,c.payload,c.signed_statement,c.created_at FROM witness_deliveries d JOIN checkpoints c ON c.log_id=d.log_id AND c.mmr_size=d.mmr_size WHERE d.log_id=? AND d.witness_id=? AND d.state IN (?,?) AND NOT EXISTS(SELECT 1 FROM witness_deliveries blocked WHERE blocked.log_id=d.log_id AND blocked.witness_id=d.witness_id AND blocked.state=?) ORDER BY d.mmr_size LIMIT ?`, s.logID, witnessID, ledger.WitnessPending, ledger.WitnessRetryable, ledger.WitnessContinuityConflict, limit)
+	rows, err := s.db.QueryContext(ctx, `SELECT d.state,d.attempts,d.next_attempt_at,d.last_error,c.indexed_seq,c.mmr_size,c.root,c.payload,c.signed_checkpoint,c.created_at FROM witness_deliveries d JOIN checkpoints c ON c.log_id=d.log_id AND c.mmr_size=d.mmr_size WHERE d.log_id=? AND d.witness_id=? AND d.state IN (?,?) AND NOT EXISTS(SELECT 1 FROM witness_deliveries blocked WHERE blocked.log_id=d.log_id AND blocked.witness_id=d.witness_id AND blocked.state=?) ORDER BY d.mmr_size LIMIT ?`, s.logID, witnessID, ledger.WitnessPending, ledger.WitnessRetryable, ledger.WitnessContinuityConflict, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -529,7 +531,7 @@ func (s *Store) PendingWitnesses(ctx context.Context, witnessID string, limit in
 	for rows.Next() {
 		item := ledger.PendingWitness{WitnessID: witnessID}
 		var next sql.NullTime
-		if err := rows.Scan(&item.State, &item.Attempts, &next, &item.LastError, &item.Checkpoint.IndexedSeq, &item.Checkpoint.MMRSize, &item.Checkpoint.Root, &item.Checkpoint.Payload, &item.Checkpoint.SignedStatement, &item.Checkpoint.CreatedAt); err != nil {
+		if err := rows.Scan(&item.State, &item.Attempts, &next, &item.LastError, &item.Checkpoint.IndexedSeq, &item.Checkpoint.MMRSize, &item.Checkpoint.Root, &item.Checkpoint.Payload, &item.Checkpoint.SignedCheckpoint, &item.Checkpoint.CreatedAt); err != nil {
 			return nil, err
 		}
 		if next.Valid {
@@ -597,7 +599,7 @@ func (s *Store) GetWitness(ctx context.Context, witnessID string, mmrSize uint64
 	}
 	item := ledger.PendingWitness{WitnessID: witnessID}
 	var attempted, next sql.NullTime
-	err := s.db.QueryRowContext(ctx, `SELECT d.state,d.attempts,d.attempted_at,d.next_attempt_at,d.last_error,d.receipt,c.indexed_seq,c.mmr_size,c.root,c.payload,c.signed_statement,c.created_at FROM witness_deliveries d JOIN checkpoints c ON c.log_id=d.log_id AND c.mmr_size=d.mmr_size WHERE d.log_id=? AND d.witness_id=? AND d.mmr_size=?`, s.logID, witnessID, mmrSize).Scan(&item.State, &item.Attempts, &attempted, &next, &item.LastError, &item.Receipt, &item.Checkpoint.IndexedSeq, &item.Checkpoint.MMRSize, &item.Checkpoint.Root, &item.Checkpoint.Payload, &item.Checkpoint.SignedStatement, &item.Checkpoint.CreatedAt)
+	err := s.db.QueryRowContext(ctx, `SELECT d.state,d.attempts,d.attempted_at,d.next_attempt_at,d.last_error,d.receipt,c.indexed_seq,c.mmr_size,c.root,c.payload,c.signed_checkpoint,c.created_at FROM witness_deliveries d JOIN checkpoints c ON c.log_id=d.log_id AND c.mmr_size=d.mmr_size WHERE d.log_id=? AND d.witness_id=? AND d.mmr_size=?`, s.logID, witnessID, mmrSize).Scan(&item.State, &item.Attempts, &attempted, &next, &item.LastError, &item.Receipt, &item.Checkpoint.IndexedSeq, &item.Checkpoint.MMRSize, &item.Checkpoint.Root, &item.Checkpoint.Payload, &item.Checkpoint.SignedCheckpoint, &item.Checkpoint.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ledger.PendingWitness{}, ledger.ErrNotFound
 	}

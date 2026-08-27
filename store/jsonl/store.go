@@ -21,6 +21,7 @@ import (
 const (
 	journalName          = "ledger.jsonl"
 	maxJournalEventBytes = 4 << 20
+	schemaVersion        = 2
 )
 
 type event struct {
@@ -86,7 +87,7 @@ func Open(root, logID string) (*Store, error) {
 		return nil, errors.Join(err, closeErr)
 	}
 	if !store.initialized {
-		entry := event{Version: 1, Type: "log.init", LogID: logID}
+		entry := event{Version: schemaVersion, Type: "log.init", LogID: logID}
 		if err := store.appendEvent(entry); err != nil {
 			closeErr := store.closeFiles()
 			return nil, errors.Join(err, closeErr)
@@ -139,8 +140,8 @@ func (s *Store) replay() error {
 }
 
 func (s *Store) apply(entry event) error {
-	if entry.Version != 1 {
-		return fmt.Errorf("unsupported event version %d", entry.Version)
+	if entry.Version != schemaVersion {
+		return fmt.Errorf("%w: unsupported event version %d", ledger.ErrCorrupt, entry.Version)
 	}
 	switch entry.Type {
 	case "log.init":
@@ -241,7 +242,7 @@ func (s *Store) CommitCLL(ctx context.Context, mutation ledger.CLLMutation) erro
 	if err := s.validateCLL(mutation); err != nil {
 		return err
 	}
-	entry := event{Version: 1, Type: "cll.commit", CLL: &mutation}
+	entry := event{Version: schemaVersion, Type: "cll.commit", CLL: &mutation}
 	if err := s.appendEvent(entry); err != nil {
 		return err
 	}
@@ -308,7 +309,7 @@ func (s *Store) Rebaseline(ctx context.Context, input ledger.RebaselineInput) (l
 	}
 	record := ledger.RebaselineRecord{OldLogID: s.logID, NewLogID: input.NewLogID, Reason: input.Reason, At: input.At.UTC(), MigrationID: input.MigrationID}
 	record.LastWitnessedSize = s.lastWitnessedSize()
-	entry := event{Version: 1, Type: "log.rebaseline", Rebaseline: &record}
+	entry := event{Version: schemaVersion, Type: "log.rebaseline", Rebaseline: &record}
 	if err := s.appendEvent(entry); err != nil {
 		return ledger.RebaselineRecord{}, err
 	}
@@ -423,7 +424,7 @@ func (s *Store) CommitWitness(ctx context.Context, result ledger.WitnessResult) 
 	if err := s.validateWitness(result); err != nil {
 		return err
 	}
-	entry := event{Version: 1, Type: "witness.commit", Witness: &result}
+	entry := event{Version: schemaVersion, Type: "witness.commit", Witness: &result}
 	if err := s.appendEvent(entry); err != nil {
 		return err
 	}
@@ -484,7 +485,7 @@ func (s *Store) applyWitness(result ledger.WitnessResult) error {
 func witnessKey(id string, size uint64) string { return fmt.Sprintf("%s:%d", id, size) }
 func cloneCheckpoint(in ledger.CheckpointRecord) ledger.CheckpointRecord {
 	in.Payload = clone(in.Payload)
-	in.SignedStatement = clone(in.SignedStatement)
+	in.SignedCheckpoint = clone(in.SignedCheckpoint)
 	return in
 }
 func cloneCLL(in ledger.CLLState) ledger.CLLState {
@@ -565,7 +566,7 @@ func (s *Store) Append(ctx context.Context, input ledger.AppendInput) (ledger.Re
 		Capsule: clone(input.Capsule), Envelopes: cloneEnvelopes(input.Envelopes),
 		Verification: input.Verification, ParentID: input.ParentID, AppendedAt: ledger.NormalizeTime(input.AppendedAt),
 	}
-	entry := event{Version: 1, Type: "capsule.append", Record: &record}
+	entry := event{Version: schemaVersion, Type: "capsule.append", Record: &record}
 	if err := s.appendEvent(entry); err != nil {
 		return ledger.Record{}, "", err
 	}
@@ -603,7 +604,7 @@ func (s *Store) AddEnvelope(ctx context.Context, input ledger.EnvelopeInput) (le
 		return ledger.Envelope{}, "", fmt.Errorf("%w: envelope limit reached", ledger.ErrInvalid)
 	}
 	envelope := cloneEnvelope(input.Envelope)
-	entry := event{Version: 1, Type: "envelope.add", CapsuleID: input.CapsuleID, Envelope: &envelope}
+	entry := event{Version: schemaVersion, Type: "envelope.add", CapsuleID: input.CapsuleID, Envelope: &envelope}
 	if err := s.appendEvent(entry); err != nil {
 		return ledger.Envelope{}, "", err
 	}

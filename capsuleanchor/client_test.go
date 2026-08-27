@@ -1,12 +1,12 @@
 package capsuleanchor
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -16,35 +16,34 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestClientUsesCheckpointEndpointAndSupportsHostedCompatibility(t *testing.T) {
+func TestClientUsesCheckpointOnlyEndpoint(t *testing.T) {
 	statement := checkpointStatement(t)
+	record, err := checkpoint.ParseRecord(statement)
+	require.NoError(t, err)
+	entry, err := record.EntryHash()
+	require.NoError(t, err)
 	receiptB64 := base64.StdEncoding.EncodeToString([]byte("receipt"))
-	entryHash := fmt.Sprintf("%064x", 1)
-	root := fmt.Sprintf("%064x", 2)
-	withWitness := func(scheme string) string {
-		return fmt.Sprintf(`{"receipt_b64":%q,"entry_hash":%q,"entry_hash_scheme":%q,"leaf_index":0,"tree_size":1,"future_field":"allowed","checkpoint_witness":{"log_id":"log","key_id":"key","mmr_root":%q,"mmr_size":1,"prev_size":0,"timestamp":"2026-08-25T00:00:00Z","status":"first-seen"}}`, receiptB64, entryHash, scheme, root)
-	}
-	digest := sha256.Sum256(statement)
+	entryHash := fmt.Sprintf("%x", entry)
 	tests := []struct {
-		name       string
-		response   string
-		wantScheme string
-		wantStatus string
-		wantError  string
+		name      string
+		response  string
+		wantError string
 	}{
-		{name: "current", response: withWitness(EntryHashSchemeSigStructure), wantScheme: EntryHashSchemeSigStructure, wantStatus: "first-seen"},
-		{name: "current migration", response: withWitness(EntryHashSchemeLegacy), wantScheme: EntryHashSchemeLegacy, wantStatus: "first-seen"},
-		{name: "older hosted", response: fmt.Sprintf(`{"receipt_b64":%q,"entry_hash":%q,"leaf_index":0,"tree_size":1}`, receiptB64, hex.EncodeToString(digest[:])), wantScheme: EntryHashSchemeStatementBytes},
-		{name: "current without witness", response: fmt.Sprintf(`{"receipt_b64":%q,"entry_hash":%q,"entry_hash_scheme":"sig_structure","leaf_index":0,"tree_size":1}`, receiptB64, entryHash), wantError: "checkpoint witness response is required"},
-		{name: "omitted scheme with witness", response: withWitness(""), wantError: "omitted-scheme response"},
-		{name: "local scheme on wire", response: withWitness(EntryHashSchemeStatementBytes), wantError: "unsupported entry hash scheme"},
+		{name: "current", response: fmt.Sprintf(`{"receipt_b64":%q,"entry_hash":%q,"entry_hash_scheme":"legacy","leaf_index":0,"tree_size":1,"future_field":"allowed"}`, receiptB64, entryHash)},
+		{name: "missing scheme", response: fmt.Sprintf(`{"receipt_b64":%q,"entry_hash":%q,"leaf_index":0,"tree_size":1}`, receiptB64, entryHash), wantError: "unsupported entry hash scheme"},
+		{name: "old statement scheme", response: fmt.Sprintf(`{"receipt_b64":%q,"entry_hash":%q,"entry_hash_scheme":"sig_structure","leaf_index":0,"tree_size":1}`, receiptB64, entryHash), wantError: "unsupported entry hash scheme"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-				require.Equal(t, "/transparency/register-statement", request.URL.Path)
+				require.Equal(t, "/v1/checkpoint", request.URL.Path)
+				require.Equal(t, http.MethodPost, request.Method)
+				require.Equal(t, "application/json", request.Header.Get("Content-Type"))
+				body, err := io.ReadAll(request.Body)
+				require.NoError(t, err)
+				require.True(t, bytes.Equal(statement, body))
 				writer.Header().Set("Content-Type", "application/json")
-				_, err := writer.Write([]byte(test.response))
+				_, err = writer.Write([]byte(test.response))
 				require.NoError(t, err)
 			}))
 			t.Cleanup(server.Close)
@@ -56,13 +55,12 @@ func TestClientUsesCheckpointEndpointAndSupportsHostedCompatibility(t *testing.T
 				return
 			}
 			require.NoError(t, err)
-			require.Equal(t, test.wantScheme, receipt.EntryHashScheme)
-			require.Equal(t, test.wantStatus, receipt.Checkpoint.Status)
+			require.Equal(t, EntryHashSchemeCheckpointDigest, receipt.EntryHashScheme)
 		})
 	}
 }
 
-func TestClientRejectsRedirectOversizeAndEchoMismatch(t *testing.T) {
+func TestClientRejectsRedirectOversizeAndInvalidPosition(t *testing.T) {
 	statement := checkpointStatement(t)
 	t.Run("redirect", func(t *testing.T) {
 		followed := false
@@ -92,20 +90,20 @@ func TestClientRejectsRedirectOversizeAndEchoMismatch(t *testing.T) {
 		require.ErrorContains(t, err, "exceeds")
 	})
 
-	t.Run("echo mismatch", func(t *testing.T) {
+	t.Run("invalid position", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
-			_, err := fmt.Fprintf(writer, `{"receipt_b64":%q,"entry_hash":%q,"entry_hash_scheme":"sig_structure","leaf_index":0,"tree_size":1,"checkpoint_witness":{"log_id":"another-log","key_id":"key","mmr_root":%q,"mmr_size":1,"prev_size":0,"timestamp":"2026-08-25T00:00:00Z","status":"first-seen"}}`, base64.StdEncoding.EncodeToString([]byte("receipt")), fmt.Sprintf("%064x", 1), fmt.Sprintf("%064x", 2))
+			_, err := fmt.Fprintf(writer, `{"receipt_b64":%q,"entry_hash":%q,"entry_hash_scheme":"legacy","leaf_index":1,"tree_size":1}`, base64.StdEncoding.EncodeToString([]byte("receipt")), fmt.Sprintf("%064x", 1))
 			require.NoError(t, err)
 		}))
 		t.Cleanup(server.Close)
 		client, err := NewClient(server.URL, server.Client(), 4096)
 		require.NoError(t, err)
 		_, err = client.Submit(t.Context(), statement)
-		require.ErrorContains(t, err, "echo mismatch")
+		require.ErrorContains(t, err, "invalid transparency position")
 	})
 }
 
-func TestClientClassifiesContinuityAndRetryableFailures(t *testing.T) {
+func TestClientClassifiesRetryableFailures(t *testing.T) {
 	statement := checkpointStatement(t)
 	status := http.StatusConflict
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) { http.Error(writer, "failure", status) }))
@@ -113,7 +111,7 @@ func TestClientClassifiesContinuityAndRetryableFailures(t *testing.T) {
 	client, err := NewClient(server.URL, server.Client(), 4096)
 	require.NoError(t, err)
 	_, err = client.Submit(t.Context(), statement)
-	require.True(t, IsContinuityConflict(err))
+	require.False(t, IsRetryable(err))
 	status = http.StatusTooManyRequests
 	_, err = client.Submit(t.Context(), statement)
 	require.True(t, IsRetryable(err))
@@ -123,10 +121,10 @@ func checkpointStatement(t *testing.T) []byte {
 	t.Helper()
 	_, private, err := ed25519.GenerateKey(rand.Reader)
 	require.NoError(t, err)
-	signer, err := checkpoint.NewEd25519Signer("key", private)
+	signer, err := checkpoint.NewEd25519Signer(private)
 	require.NoError(t, err)
 	payload, err := (checkpoint.Payload{
-		LogID: "log", KeyID: "key", MMRSize: 1, Root: fmt.Sprintf("%064x", 2),
+		LogID: "log", KeyID: signer.KeyID(), MMRSize: 1, Root: fmt.Sprintf("%064x", 2),
 		Timestamp: time.Date(2026, 8, 25, 0, 0, 0, 0, time.UTC),
 	}).CanonicalJSON()
 	require.NoError(t, err)
