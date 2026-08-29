@@ -1,8 +1,9 @@
 package ledger
 
 // baselineRegistries mirrors spec/REGISTRY.md at agent-action-capsule commit
-// 7dcef86634355c0d3335b3050b1bc18845716275. Keeping the parsed baseline in the
-// binary prevents verifier behavior from depending on the host working directory.
+// 7e112c8b877ad79d4d2a53be7b522a63470a2b1d (BSD-3-Clause). Keeping the
+// parsed baseline in the binary prevents verifier behavior from depending on
+// the host working directory.
 var baselineRegistries = map[string]map[string]bool{
 	"verdict_class": set(
 		"executed", "blocked", "hitl_dispatched", "denied", "timeout",

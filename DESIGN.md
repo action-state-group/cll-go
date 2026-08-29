@@ -25,15 +25,15 @@ Action State Group.
 ## Source baseline
 
 The initial design was checked against these `origin/main` commits on
-2026-08-25. The checkpoint and witness rows were refreshed on 2026-08-28 for
-the canonical COSE checkpoint migration:
+2026-08-25. Compatibility-critical rows were refreshed on 2026-08-29 for the
+three-state admission and Capsule ID contract:
 
 | Repository | Commit | Use |
 |---|---|---|
-| `action-state-group/agent-action-capsule` | `7dcef86634355c0d3335b3050b1bc18845716275` | AAC format-4 verifier, JCS Capsule ID, Producer Envelope verifier, vectors |
-| `ethanyzhang/capsule-producer-go` | `cb9de82a792c387e64f39f719221511b3fa27b49` | producer/ledger boundary and Go version |
-| `action-state-group/capsule-emit` | `aa9f2fd00e8b1343a8f86a05479051a184155496` | canonical CLL checkpoint COSE profile and interoperability vectors |
-| `action-state-group/capsule-ledger` | `01f2ae6c4e7d54793ed308a624c367e702a8d089` | sequence, chain-gap, and checkpoint persistence behavior |
+| `action-state-group/agent-action-capsule` | `7e112c8b877ad79d4d2a53be7b522a63470a2b1d` | AAC 0.2.0 format-4 verifier, plain-JCS Capsule ID with local-only envelope-field exclusion, Producer Envelope verifier, vectors |
+| `ethanyzhang/capsule-producer-go` | `5185fed4e5c47b6f545e936927641e3b36e68ba4` | producer/ledger boundary and Go version |
+| `action-state-group/capsule-emit` | `aa9f2fd00e8b1343a8f86a05479051a184155496` | 0.5.1 Capsule shape, canonical CLL checkpoint COSE profile, and interoperability vectors |
+| `action-state-group/capsule-ledger` | `f3c37376d61f97327c1fc6a6ce519c9357317177` | explicit unsigned/signed admission, authenticity persistence, sequence, chain-gap, and checkpoint behavior |
 | `action-state-group/capsule-anchor` | `26083a7bd7720267cdd4e3711e8d76689ea989be` | canonical `/checkpoints` COSE request, signature gate, response, and receipt contract |
 | `datatrails/go-datatrails-merklelog` | `275103a34a08e56a376107246e04dc5819cc44cc` | MMRIVER-compatible Go reference and KATs |
 | `action-state-group/scitt-cose` | `36ec13992287a463481d1b00ac2098f032f229b5` | independent Go COSE/receipt verifier and conformance vectors |
@@ -98,16 +98,30 @@ func (s *Service) Audit(ctx context.Context, maxRecords int) ([]RecordVerificati
 ```
 
 Returned byte slices are defensive copies. `Append` verifies the Capsule and
-every provided envelope before the durable write. `AdmissionSigned` requires
-at least one envelope and rejects the entire append if any supplied envelope
-does not verify against the recomputed Capsule ID. `AdmissionUnsigned` rejects
-envelopes. Envelope presence never selects or changes the admission mode.
+evaluates every candidate envelope before the durable write. `AdmissionSigned`
+requires at least one envelope that verifies against the recomputed Capsule ID,
+persists every verifying candidate, and rejects only when none verify. Its
+candidates are the explicit envelope arguments plus an embedded `signature`
+and `key_id` pair when both Capsule fields are hexadecimal strings. The decoded
+key ID must equal the public key authenticated by the decoded Producer Envelope.
+Candidates that fail to decode, exceed the envelope size bound, or fail
+verification are skipped. `AdmissionUnsigned` rejects explicit envelopes and
+does not consult embedded fields. Envelope presence never selects or changes
+the admission mode. An append with more than `MaxEnvelopesPerCapsule` distinct
+verifying candidates is rejected as invalid input.
 `ErrAdmission` wraps `ErrInvalid`, so hosts can classify it as bad caller input
 while retaining the narrower admission-rejection signal. Duplicate input
 returns the stored record after exact-byte comparison of the Capsule and every supplied
 Envelope. Envelopes added after the original append may be present in that
-stored result and do not make an older append retry conflict. `Get` requires an
-exact ID; prefix lookup is deliberately absent from the integrity API.
+stored result and do not make an older append retry conflict. Local-only fields
+can produce the same Capsule ID from different transport bytes, but those byte
+representations are not idempotent retries: changing the stored Capsule bytes
+is a conflict. Changing the declared mode is also a conflict, even for
+byte-identical Capsule input, so a signed retry cannot upgrade an unsigned
+admission. New signer evidence for an existing record uses `AddEnvelope`. That
+method accepts decoded Producer Envelope bytes and never upgrades an unsigned
+admission's authenticity. `Get` requires an exact ID; prefix lookup is
+deliberately absent from the integrity API.
 
 `VerificationResult` preserves the upstream `OK`, structured findings,
 severity, numbered check, derived assurance, and recomputed Capsule ID.
@@ -221,6 +235,12 @@ Capsule bytes are decoded only through upstream `verify.DecodeCapsuleJSON`,
 which preserves integers as `json.Number`. Plain `json.Unmarshal` is forbidden
 because it produces `float64`, breaks JCS recomputation, and bypasses upstream
 float and unsafe-integer guards.
+
+The Go module must remain pinned at the recorded AAC revision or a later
+revision that preserves the AAC 0.2.0 identity contract. Format-4 Capsule IDs
+are plain RFC 8785 JCS digests after excluding the local-only `capsule_id`,
+`signature`, and `key_id` fields. The ledger must not recreate the older
+absent-field normalization or include Producer Envelope fields in the preimage.
 
 The library vendors the baseline `spec/REGISTRY.md` with BSD-3-Clause
 attribution and embeds its parsed map as Go data. A test loads the vendored file
@@ -525,7 +545,8 @@ commit's required workflow is green.
 1. All three stores pass the same contract suite for append, idempotency,
    conflict, envelopes, ordering, gaps, concurrency, restart, CLL state,
    per-witness delivery, and rebaseline.
-2. Upstream AAC format-4 and Producer Envelope vectors match expected outcomes.
+2. Upstream AAC format-4, Producer Envelope, and `capsule-emit` local-only-field
+   identity vectors match expected outcomes, including embedded key-ID binding.
 3. Python/DataTrails known-answer vectors match roots and proofs, including
    multi-peak and adversarial cases.
 4. Checkpoint signatures and local chain consistency verify after restart.

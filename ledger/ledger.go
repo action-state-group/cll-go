@@ -61,9 +61,6 @@ func (s *Service) Append(ctx context.Context, mode AdmissionMode, capsule []byte
 	if mode == AdmissionUnsigned && len(envelopes) != 0 {
 		return Record{}, fmt.Errorf("%w: unsigned admission does not permit Producer Envelopes", ErrAdmission)
 	}
-	if mode == AdmissionSigned && len(envelopes) == 0 {
-		return Record{}, fmt.Errorf("%w: signed admission requires a Producer Envelope", ErrAdmission)
-	}
 	verification, id, err := s.verifier.VerifyCapsule(capsule)
 	if err != nil {
 		return Record{}, err
@@ -73,12 +70,32 @@ func (s *Service) Append(ctx context.Context, mode AdmissionMode, capsule []byte
 		return Record{}, err
 	}
 	appendedAt := NormalizeTime(s.now())
-	verifiedEnvelopes := make([]Envelope, 0, len(envelopes))
-	seen := make(map[EnvelopeDigest][]byte, len(envelopes))
+	candidates := make([]envelopeCandidate, 0, len(envelopes)+1)
 	for _, raw := range envelopes {
+		candidates = append(candidates, envelopeCandidate{raw: raw})
+	}
+	if mode == AdmissionSigned {
+		if embedded, present := embeddedProducerEnvelope(capsule); present {
+			candidates = append(candidates, embedded)
+		}
+	}
+	verifiedEnvelopes := make([]Envelope, 0, len(candidates))
+	seen := make(map[EnvelopeDigest][]byte, len(candidates))
+	var firstCandidateErr error
+	for _, candidate := range candidates {
+		raw := candidate.raw
 		envelopeVerification, verifyErr := s.verifier.VerifyEnvelope(id, raw)
 		if verifyErr != nil {
-			return Record{}, fmt.Errorf("%w: Producer Envelope verification failed: %v", ErrAdmission, verifyErr)
+			if firstCandidateErr == nil {
+				firstCandidateErr = verifyErr
+			}
+			continue
+		}
+		if candidate.requiredPublicKey != nil && !bytes.Equal(candidate.requiredPublicKey, envelopeVerification.PublicKey) {
+			if firstCandidateErr == nil {
+				firstCandidateErr = fmt.Errorf("embedded key_id does not match the authenticated Producer Envelope key")
+			}
+			continue
 		}
 		digest := digestEnvelope(raw)
 		if previous, exists := seen[digest]; exists {
@@ -92,6 +109,15 @@ func (s *Service) Append(ctx context.Context, mode AdmissionMode, capsule []byte
 			Digest: digest, Bytes: cloneBytes(raw), Verification: envelopeVerification,
 			AddedAt: appendedAt,
 		})
+	}
+	if mode == AdmissionSigned && len(verifiedEnvelopes) == 0 {
+		if firstCandidateErr != nil {
+			return Record{}, fmt.Errorf("%w: no Producer Envelope verifies against the recomputed Capsule ID: %v", ErrAdmission, firstCandidateErr)
+		}
+		return Record{}, fmt.Errorf("%w: no Producer Envelope verifies against the recomputed Capsule ID", ErrAdmission)
+	}
+	if len(verifiedEnvelopes) > MaxEnvelopesPerCapsule {
+		return Record{}, fmt.Errorf("%w: too many verified envelopes", ErrInvalid)
 	}
 	authenticity := AuthenticityUnsigned
 	if mode == AdmissionSigned {
@@ -182,6 +208,36 @@ func capsuleParent(data []byte) (CapsuleID, error) {
 		return "", fmt.Errorf("%w: malformed parent capsule id", ErrInvalid)
 	}
 	return CapsuleID(parent), nil
+}
+
+type envelopeCandidate struct {
+	raw               []byte
+	requiredPublicKey []byte
+}
+
+// embeddedProducerEnvelope extracts capsule-emit's local-only envelope fields.
+// Their presence is evidence only; the caller's explicit admission mode still
+// decides whether they are considered.
+func embeddedProducerEnvelope(data []byte) (envelopeCandidate, bool) {
+	decoded, err := aacverify.DecodeCapsuleJSON(data)
+	if err != nil {
+		return envelopeCandidate{}, false
+	}
+	capsule, ok := decoded.(map[string]any)
+	if !ok {
+		return envelopeCandidate{}, false
+	}
+	signatureHex, signatureOK := capsule["signature"].(string)
+	keyIDHex, keyIDOK := capsule["key_id"].(string)
+	if !signatureOK || !keyIDOK {
+		return envelopeCandidate{}, false
+	}
+	signature, signatureErr := hex.DecodeString(signatureHex)
+	keyID, keyIDErr := hex.DecodeString(keyIDHex)
+	if signatureErr != nil || keyIDErr != nil {
+		return envelopeCandidate{}, false
+	}
+	return envelopeCandidate{raw: signature, requiredPublicKey: keyID}, true
 }
 
 func validID(id CapsuleID) bool {

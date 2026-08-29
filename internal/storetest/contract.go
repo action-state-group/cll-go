@@ -4,6 +4,8 @@ package storetest
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	_ "embed"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"sync"
@@ -11,6 +13,7 @@ import (
 	"time"
 
 	"github.com/action-state-group/agent-action-capsule/go/canonical"
+	aacverify "github.com/action-state-group/agent-action-capsule/go/verify"
 	"github.com/ethanyzhang/capsule-ledger-go/ledger"
 	producer "github.com/ethanyzhang/capsule-producer-go"
 	"github.com/stretchr/testify/assert"
@@ -18,6 +21,14 @@ import (
 )
 
 const validCapsule = `{"action_id":"v4-chain","action_type":"decide","assurance":{"attestation_mode":"self_attested","effect_mode":"not_applicable","ledger_mode":"chained"},"canonicalization_id":"jcs","capsule_id":"862024869f00481bb4f59d9528a45c2d4885f64c5222a9324a38ac2c2cd119f2","chain":{"parent_capsule_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","relation":"confirms"},"constraints":[],"developer":"agent@v1","disposition":{"approver":"policy","decision":"accept","human_disposed":false,"verdict_class":"executed"},"format_version":"4","operator":"ACME-CO","spec_version":"draft-mih-scitt-agent-action-capsule-04","timestamp":"2026-08-24T00:00:00Z"}`
+
+// capsuleEmitV051 is the first upstream capsule-emit 0.5.1 interoperability
+// fixture from agent-action-capsule commit
+// 7e112c8b877ad79d4d2a53be7b522a63470a2b1d (BSD-3-Clause), at
+// python/tests/fixtures/capsule_emit_ledger.jsonl.
+//
+//go:embed testdata/capsule-emit-v0.5.1.json
+var capsuleEmitV051 []byte
 
 type Factory func(t *testing.T, logID string) ledger.Store
 type CLLFactory func(t *testing.T, logID string) ledger.CLLStore
@@ -157,19 +168,20 @@ func Run(t *testing.T, open Factory) {
 	})
 }
 
-// RunAdmission applies the five shared Python/Go admission cases to a Store
-// backend through the public Service boundary.
+// RunAdmission applies the Python admission contract and capsule-emit's
+// embedded-envelope shape to a Store backend through the public Service
+// boundary.
 func RunAdmission(t *testing.T, open Factory) {
 	t.Helper()
 	capsule := []byte(validCapsule)
 	validEnvelope := producerEnvelope(t, capsule)
+	sealedCapsule := withEmbeddedEnvelope(t, capsule, validEnvelope)
+	strippedCapsule := withoutEmbeddedEnvelope(t, capsuleEmitV051)
 	wrongCapsule := mutateCapsule(t, capsule, "v4-chain-wrong-envelope")
 	wrongEnvelope := producerEnvelope(t, wrongCapsule)
 
 	t.Run("declared unsigned records explicit state", func(t *testing.T) {
-		store := open(t, "admission-unsigned")
-		service, err := ledger.New(store, ledger.Config{})
-		require.NoError(t, err)
+		_, service := newService(t, open, "admission-unsigned")
 		record, err := service.Append(t.Context(), ledger.AdmissionUnsigned, capsule)
 		require.NoError(t, err)
 		assert.Equal(t, ledger.AuthenticityUnsigned, record.Authenticity)
@@ -177,38 +189,32 @@ func RunAdmission(t *testing.T, open Factory) {
 	})
 
 	t.Run("declared signed missing envelope rejects before mutation", func(t *testing.T) {
-		store := open(t, "admission-missing")
-		service, err := ledger.New(store, ledger.Config{})
-		require.NoError(t, err)
-		_, err = service.Append(t.Context(), ledger.AdmissionSigned, capsule)
-		require.ErrorIs(t, err, ledger.ErrAdmission)
-		assertEmptyStore(t, store)
-	})
-
-	t.Run("declared signed invalid envelope rejects before mutation", func(t *testing.T) {
-		store := open(t, "admission-invalid")
-		service, err := ledger.New(store, ledger.Config{})
-		require.NoError(t, err)
-		_, err = service.Append(t.Context(), ledger.AdmissionSigned, capsule, wrongEnvelope)
-		require.ErrorIs(t, err, ledger.ErrAdmission)
-		assertEmptyStore(t, store)
-	})
-
-	t.Run("declared signed mixed valid and invalid envelopes rejects before mutation", func(t *testing.T) {
-		store := open(t, "admission-mixed")
-		service, err := ledger.New(store, ledger.Config{})
-		require.NoError(t, err)
-		_, err = service.Append(t.Context(), ledger.AdmissionSigned, capsule, validEnvelope, wrongEnvelope)
+		store, service := newService(t, open, "admission-missing")
+		_, err := service.Append(t.Context(), ledger.AdmissionSigned, capsule)
 		require.ErrorIs(t, err, ledger.ErrAdmission)
 		require.ErrorIs(t, err, ledger.ErrInvalid)
 		assertEmptyStore(t, store)
 	})
 
+	t.Run("declared signed invalid envelope rejects before mutation", func(t *testing.T) {
+		store, service := newService(t, open, "admission-invalid")
+		_, err := service.Append(t.Context(), ledger.AdmissionSigned, capsule, wrongEnvelope)
+		require.ErrorIs(t, err, ledger.ErrAdmission)
+		assertEmptyStore(t, store)
+	})
+
+	t.Run("declared signed mixed valid and invalid envelopes keeps valid evidence", func(t *testing.T) {
+		_, service := newService(t, open, "admission-mixed")
+		record, err := service.Append(t.Context(), ledger.AdmissionSigned, capsule, wrongEnvelope, validEnvelope)
+		require.NoError(t, err)
+		assert.Equal(t, ledger.AuthenticitySigned, record.Authenticity)
+		require.Len(t, record.Envelopes, 1)
+		assert.Equal(t, validEnvelope, record.Envelopes[0].Bytes)
+	})
+
 	t.Run("declared signed valid envelope persists and reverifies", func(t *testing.T) {
 		const logID = "admission-valid"
-		store := open(t, logID)
-		service, err := ledger.New(store, ledger.Config{})
-		require.NoError(t, err)
+		store, service := newService(t, open, logID)
 		record, err := service.Append(t.Context(), ledger.AdmissionSigned, capsule, validEnvelope)
 		require.NoError(t, err)
 		assert.Equal(t, ledger.AuthenticitySigned, record.Authenticity)
@@ -225,6 +231,119 @@ func RunAdmission(t *testing.T, open Factory) {
 		assert.Equal(t, stored.Envelopes[0].Verification.PublicKey, verification.PublicKey)
 	})
 
+	t.Run("declared signed accepts embedded capsule-emit envelope and persists it", func(t *testing.T) {
+		const logID = "admission-embedded"
+		store, service := newService(t, open, logID)
+		record, err := service.Append(t.Context(), ledger.AdmissionSigned, sealedCapsule)
+		require.NoError(t, err)
+		assert.Equal(t, ledger.AuthenticitySigned, record.Authenticity)
+		require.Len(t, record.Envelopes, 1)
+		assert.Equal(t, validEnvelope, record.Envelopes[0].Bytes)
+		require.NoError(t, store.Close())
+		reopened := open(t, logID)
+		stored, err := reopened.Get(t.Context(), record.CapsuleID)
+		require.NoError(t, err)
+		require.Len(t, stored.Envelopes, 1)
+		verification, err := (ledger.AACVerifier{}).VerifyEnvelope(stored.CapsuleID, stored.Envelopes[0].Bytes)
+		require.NoError(t, err)
+		assert.True(t, verification.OK)
+	})
+
+	t.Run("capsule-emit 0.5.1 fixture admits and verifies from embedded evidence", func(t *testing.T) {
+		_, service := newService(t, open, "admission-capsule-emit-v051")
+		record, err := service.Append(t.Context(), ledger.AdmissionSigned, capsuleEmitV051)
+		require.NoError(t, err)
+		assert.Equal(t, ledger.CapsuleID("d0fd4075205b125aeede15b74528c3713ed6dbae40c6fd321cad7ab31ca569bb"), record.CapsuleID)
+		require.Len(t, record.Envelopes, 1)
+		verification, err := (ledger.AACVerifier{}).VerifyEnvelope(record.CapsuleID, record.Envelopes[0].Bytes)
+		require.NoError(t, err)
+		assert.Equal(t, record.Envelopes[0].Verification.PublicKey, verification.PublicKey)
+	})
+
+	t.Run("duplicate explicit and embedded evidence persists once", func(t *testing.T) {
+		_, service := newService(t, open, "admission-embedded-deduplicate")
+		record, err := service.Append(t.Context(), ledger.AdmissionSigned, sealedCapsule, validEnvelope)
+		require.NoError(t, err)
+		require.Len(t, record.Envelopes, 1)
+		assert.Equal(t, validEnvelope, record.Envelopes[0].Bytes)
+	})
+
+	t.Run("declared signed rejects capsule with stripped embedded envelope", func(t *testing.T) {
+		store, service := newService(t, open, "admission-stripped-embedded")
+		_, err := service.Append(t.Context(), ledger.AdmissionSigned, strippedCapsule)
+		require.ErrorIs(t, err, ledger.ErrAdmission)
+		assertEmptyStore(t, store)
+	})
+
+	t.Run("declared signed rejects embedded key id mismatch", func(t *testing.T) {
+		store, service := newService(t, open, "admission-embedded-key-mismatch")
+		embeddedCapsule := withEmbeddedFields(t, capsule, hex.EncodeToString(validEnvelope), hex.EncodeToString(make([]byte, ed25519.PublicKeySize)))
+		_, err := service.Append(t.Context(), ledger.AdmissionSigned, embeddedCapsule)
+		require.ErrorIs(t, err, ledger.ErrAdmission)
+		assertEmptyStore(t, store)
+	})
+
+	t.Run("declared signed skips malformed embedded candidate when explicit evidence verifies", func(t *testing.T) {
+		_, service := newService(t, open, "admission-malformed-embedded")
+		malformed := withEmbeddedFields(t, capsule, "not-hex", hex.EncodeToString(make([]byte, ed25519.PublicKeySize)))
+		record, err := service.Append(t.Context(), ledger.AdmissionSigned, malformed, validEnvelope)
+		require.NoError(t, err)
+		require.Len(t, record.Envelopes, 1)
+		assert.Equal(t, validEnvelope, record.Envelopes[0].Bytes)
+	})
+
+	t.Run("declared unsigned ignores embedded envelope fields", func(t *testing.T) {
+		_, service := newService(t, open, "admission-unsigned-embedded")
+		record, err := service.Append(t.Context(), ledger.AdmissionUnsigned, sealedCapsule)
+		require.NoError(t, err)
+		assert.Equal(t, ledger.AuthenticityUnsigned, record.Authenticity)
+		assert.Empty(t, record.Envelopes)
+	})
+
+	t.Run("signed retry cannot upgrade an unsigned admission", func(t *testing.T) {
+		store, service := newService(t, open, "admission-mode-conflict")
+		unsigned, err := service.Append(t.Context(), ledger.AdmissionUnsigned, sealedCapsule)
+		require.NoError(t, err)
+		_, err = service.Append(t.Context(), ledger.AdmissionSigned, sealedCapsule)
+		require.ErrorIs(t, err, ledger.ErrConflict)
+		stored, err := store.Get(t.Context(), unsigned.CapsuleID)
+		require.NoError(t, err)
+		assert.Equal(t, ledger.AuthenticityUnsigned, stored.Authenticity)
+		assert.Empty(t, stored.Envelopes)
+	})
+
+	t.Run("local-only transport changes retain identity but conflict with stored bytes", func(t *testing.T) {
+		_, service := newService(t, open, "admission-local-only-conflict")
+		_, sealedID, err := (ledger.AACVerifier{}).VerifyCapsule(capsuleEmitV051)
+		require.NoError(t, err)
+		_, strippedID, err := (ledger.AACVerifier{}).VerifyCapsule(strippedCapsule)
+		require.NoError(t, err)
+		assert.Equal(t, sealedID, strippedID)
+		record, err := service.Append(t.Context(), ledger.AdmissionSigned, capsuleEmitV051)
+		require.NoError(t, err)
+		require.Len(t, record.Envelopes, 1)
+		_, err = service.Append(t.Context(), ledger.AdmissionSigned, strippedCapsule, record.Envelopes[0].Bytes)
+		require.ErrorIs(t, err, ledger.ErrConflict)
+	})
+
+	t.Run("too many distinct verified candidates rejects", func(t *testing.T) {
+		store, service := newService(t, open, "admission-too-many-verified")
+		explicit := make([][]byte, ledger.MaxEnvelopesPerCapsule)
+		for index := range explicit {
+			explicit[index] = producerEnvelope(t, capsule)
+		}
+		_, err := service.Append(t.Context(), ledger.AdmissionSigned, sealedCapsule, explicit...)
+		require.ErrorIs(t, err, ledger.ErrInvalid)
+		assertEmptyStore(t, store)
+	})
+}
+
+func newService(t *testing.T, open Factory, logID string) (ledger.Store, *ledger.Service) {
+	t.Helper()
+	store := open(t, logID)
+	service, err := ledger.New(store, ledger.Config{})
+	require.NoError(t, err)
+	return store, service
 }
 
 func assertEmptyStore(t *testing.T, store ledger.Store) {
@@ -247,14 +366,48 @@ func producerEnvelope(t *testing.T, capsule []byte) []byte {
 	return envelope
 }
 
+func withEmbeddedEnvelope(t *testing.T, capsule, envelope []byte) []byte {
+	t.Helper()
+	_, capsuleID, err := (ledger.AACVerifier{}).VerifyCapsule(capsule)
+	require.NoError(t, err)
+	verification, err := (ledger.AACVerifier{}).VerifyEnvelope(capsuleID, envelope)
+	require.NoError(t, err)
+	return withEmbeddedFields(t, capsule, hex.EncodeToString(envelope), hex.EncodeToString(verification.PublicKey))
+}
+
+func withEmbeddedFields(t *testing.T, capsule []byte, signature, keyID string) []byte {
+	t.Helper()
+	return rewriteCapsule(t, capsule, func(value map[string]any) {
+		value["signature"] = signature
+		value["key_id"] = keyID
+	})
+}
+
+func withoutEmbeddedEnvelope(t *testing.T, capsule []byte) []byte {
+	t.Helper()
+	return rewriteCapsule(t, capsule, func(value map[string]any) {
+		delete(value, "signature")
+		delete(value, "key_id")
+	})
+}
+
 func mutateCapsule(t *testing.T, capsule []byte, actionID string) []byte {
 	t.Helper()
-	var value map[string]any
-	require.NoError(t, json.Unmarshal(capsule, &value))
-	value["action_id"] = actionID
-	id, err := canonical.ComputeCapsuleID(value)
+	return rewriteCapsule(t, capsule, func(value map[string]any) {
+		value["action_id"] = actionID
+		id, err := canonical.ComputeCapsuleID(value)
+		require.NoError(t, err)
+		value["capsule_id"] = id
+	})
+}
+
+func rewriteCapsule(t *testing.T, capsule []byte, mutate func(map[string]any)) []byte {
+	t.Helper()
+	decoded, err := aacverify.DecodeCapsuleJSON(capsule)
 	require.NoError(t, err)
-	value["capsule_id"] = id
+	value, ok := decoded.(map[string]any)
+	require.True(t, ok)
+	mutate(value)
 	encoded, err := json.Marshal(value)
 	require.NoError(t, err)
 	return encoded

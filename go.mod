@@ -3,7 +3,7 @@ module github.com/ethanyzhang/capsule-ledger-go
 go 1.27.0
 
 require (
-	github.com/action-state-group/agent-action-capsule/go v0.0.0-20260825230033-7dcef8663435
+	github.com/action-state-group/agent-action-capsule/go v0.0.0-20260829034405-7e112c8b877a
 	github.com/datatrails/go-datatrails-merklelog/mmr v0.4.2-0.20250428132117-275103a34a08
 	github.com/ethanyzhang/capsule-producer-go v0.0.0-20260826185326-5185fed4e5c4
 	github.com/fxamacker/cbor/v2 v2.9.0
