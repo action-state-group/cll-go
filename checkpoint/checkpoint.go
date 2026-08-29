@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -13,6 +14,9 @@ import (
 
 	"github.com/action-state-group/agent-action-capsule/go/canonical"
 	"github.com/ethanyzhang/capsule-ledger-go/ledger"
+	"github.com/ethanyzhang/capsule-ledger-go/mmr"
+	"github.com/fxamacker/cbor/v2"
+	"github.com/veraison/go-cose"
 )
 
 // MaxEncodedBytes bounds canonical checkpoint signing bodies and signed records.
@@ -29,8 +33,8 @@ type Payload struct {
 	Timestamp time.Time
 }
 
-// recordWire is the single JSON projection shared by signing-body and signed
-// checkpoint parsing. Signature is empty for the signing body.
+// recordWire is the exact JSON developer projection authenticated by the COSE
+// checkpoint claims.
 type recordWire struct {
 	Version   uint64 `json:"v"`
 	Kind      string `json:"kind"`
@@ -41,7 +45,6 @@ type recordWire struct {
 	PrevRoot  string `json:"prev_root"`
 	KeyID     string `json:"key_id"`
 	Timestamp string `json:"timestamp"`
-	Signature string `json:"signature,omitempty"`
 }
 
 // ParsePayload accepts only this profile's exact canonical JSON projection.
@@ -125,61 +128,129 @@ func (p Payload) DigestHex() (string, error) {
 	return hex.EncodeToString(digest[:]), nil
 }
 
-// Record is the exact signed CheckpointRecord accepted by POST /v1/checkpoint.
+// ContentType is the canonical media type for CLL checkpoint COSE statements.
+const ContentType = "application/cll-checkpoint+cbor"
+
+const wireKind = "cll-checkpoint"
+
+// Record is a verified-shape CLL checkpoint decoded from its COSE_Sign1 wire
+// statement. NewPeaks and PrevPeaks are the ordered commitment accumulators.
 type Record struct {
-	Version   uint64    `json:"v"`
-	Kind      string    `json:"kind"`
-	LogID     string    `json:"log_id"`
-	MMRSize   uint64    `json:"mmr_size"`
-	Root      string    `json:"root"`
-	PrevSize  uint64    `json:"prev_size"`
-	PrevRoot  string    `json:"prev_root"`
-	KeyID     string    `json:"key_id"`
-	Timestamp time.Time `json:"timestamp"`
-	Signature string    `json:"signature"`
+	Version          uint64
+	Kind             string
+	LogID            string
+	MMRSize          uint64
+	Root             string
+	PrevSize         uint64
+	PrevRoot         string
+	KeyID            string
+	Timestamp        time.Time
+	NewPeaks         [][]byte
+	PrevPeaks        [][]byte
+	ConsistencyProof *mmr.ConsistencyProof
+	statement        []byte
 }
 
-// Payload returns the signature-free projection covered by Record.Signature.
+// Payload returns the JSON developer projection authenticated by the COSE
+// statement's corresponding CLL claims.
 func (r Record) Payload() Payload {
 	return Payload{LogID: r.LogID, KeyID: r.KeyID, MMRSize: r.MMRSize, Root: r.Root, PrevSize: r.PrevSize, PrevRoot: r.PrevRoot, Timestamp: r.Timestamp}
 }
 
-// CanonicalJSON returns the exact checkpoint-only witness request body.
-func (r Record) CanonicalJSON() ([]byte, error) {
-	if r.Version != 1 || r.Kind != "mmr_checkpoint" {
-		return nil, fmt.Errorf("checkpoint profile fields are invalid")
-	}
-	fields, err := r.Payload().canonicalFields()
-	if err != nil {
-		return nil, err
-	}
-	signature, err := hex.DecodeString(r.Signature)
-	if err != nil || len(signature) != ed25519.SignatureSize || hex.EncodeToString(signature) != r.Signature {
-		return nil, fmt.Errorf("invalid checkpoint signature")
-	}
-	fields["signature"] = r.Signature
-	return canonical.JCS(fields)
-}
-
-// ParseRecord accepts only this profile's exact canonical signed JSON.
+// ParseRecord accepts only the canonical raw COSE_Sign1 checkpoint profile
+// consumed by POST /checkpoints.
 func ParseRecord(data []byte) (Record, error) {
 	if len(data) == 0 || len(data) > MaxEncodedBytes {
 		return Record{}, fmt.Errorf("signed checkpoint size is invalid")
 	}
-	var wire recordWire
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&wire); err != nil {
-		return Record{}, fmt.Errorf("decode signed checkpoint: %w", err)
+	var message cose.Sign1Message
+	if err := message.UnmarshalCBOR(data); err != nil {
+		return Record{}, fmt.Errorf("decode signed checkpoint COSE: %w", err)
 	}
-	timestamp, err := time.Parse(time.RFC3339Nano, wire.Timestamp)
+	reencoded, err := message.MarshalCBOR()
+	if err != nil || !bytes.Equal(reencoded, data) {
+		return Record{}, fmt.Errorf("signed checkpoint COSE is not canonical")
+	}
+	if len(message.Headers.Unprotected) != 0 || len(message.Headers.Protected) != 4 {
+		return Record{}, fmt.Errorf("checkpoint COSE headers are invalid")
+	}
+	algorithm, err := message.Headers.Protected.Algorithm()
+	if err != nil || algorithm != cose.AlgorithmEdDSA {
+		return Record{}, fmt.Errorf("checkpoint COSE algorithm is invalid")
+	}
+	contentType, ok := message.Headers.Protected[cose.HeaderLabelContentType].(string)
+	if !ok || contentType != ContentType {
+		return Record{}, fmt.Errorf("checkpoint COSE content type is invalid")
+	}
+	kid, ok := message.Headers.Protected[cose.HeaderLabelKeyID].([]byte)
+	if !ok || len(kid) != ed25519.PublicKeySize {
+		return Record{}, fmt.Errorf("checkpoint COSE key id is invalid")
+	}
+	claims, err := protectedCWTClaims(message.Headers.Protected[cose.HeaderLabelCWTClaims])
+	if err != nil || len(claims) != 2 {
+		return Record{}, fmt.Errorf("checkpoint CWT claims are invalid")
+	}
+	issuer, issuerOK := claims[cose.CWTClaimIssuer].(string)
+	subject, subjectOK := claims[cose.CWTClaimSubject].(string)
+	if !issuerOK || !subjectOK {
+		return Record{}, fmt.Errorf("checkpoint CWT identity is invalid")
+	}
+	wire, err := decodeWireClaims(message.Payload)
+	if err != nil {
+		return Record{}, err
+	}
+	if subject != fmt.Sprintf("%s#%d", issuer, wire.LogSize) {
+		return Record{}, fmt.Errorf("checkpoint CWT subject is invalid")
+	}
+	newPeaks, err := decodeCommitment(wire.Commitment, "commitment")
+	if err != nil {
+		return Record{}, err
+	}
+	prevPeaks := [][]byte{}
+	if len(wire.PrevCommitment) > 0 {
+		prevPeaks, err = decodeCommitment(wire.PrevCommitment, "previous commitment")
+		if err != nil {
+			return Record{}, err
+		}
+	}
+	timestamp, err := time.Parse(time.RFC3339Nano, wire.IssuedAt)
 	if err != nil {
 		return Record{}, fmt.Errorf("checkpoint timestamp is invalid: %w", err)
 	}
-	record := Record{Version: wire.Version, Kind: wire.Kind, LogID: wire.LogID, MMRSize: wire.MMRSize, Root: wire.Root, PrevSize: wire.PrevSize, PrevRoot: wire.PrevRoot, KeyID: wire.KeyID, Timestamp: timestamp, Signature: wire.Signature}
-	canonical, err := record.CanonicalJSON()
-	if err != nil || !bytes.Equal(canonical, data) {
-		return Record{}, fmt.Errorf("signed checkpoint is not canonical")
+	record := Record{
+		Version: 1, Kind: "mmr_checkpoint", LogID: issuer, MMRSize: wire.LogSize,
+		Root: hex.EncodeToString(rootFromPeaks(newPeaks)), PrevSize: wire.PrevSize,
+		PrevRoot: hex.EncodeToString(rootFromPeaks(prevPeaks)), KeyID: hex.EncodeToString(kid),
+		Timestamp: timestamp, NewPeaks: clonePeaks(newPeaks), PrevPeaks: clonePeaks(prevPeaks),
+		statement: append([]byte(nil), data...),
+	}
+	if wire.ConsistencyProof != nil {
+		record.ConsistencyProof = &mmr.ConsistencyProof{
+			OldSize: wire.ConsistencyProof.SizeA, NewSize: wire.ConsistencyProof.SizeB,
+			OldPeaks: clonePeaks(wire.ConsistencyProof.OldPeaks),
+			Witness:  cloneWitness(wire.ConsistencyProof.Witness),
+			NewPeaks: clonePeaks(wire.ConsistencyProof.NewPeaks),
+		}
+	}
+	if record.PrevSize == 0 {
+		if len(record.PrevPeaks) != 0 {
+			return Record{}, fmt.Errorf("first checkpoint has a previous commitment")
+		}
+		record.PrevRoot = ""
+	} else if len(record.PrevPeaks) == 0 {
+		return Record{}, fmt.Errorf("checkpoint previous commitment is required")
+	}
+	if record.PrevSize == 0 {
+		if record.ConsistencyProof != nil {
+			return Record{}, fmt.Errorf("first checkpoint cannot carry a consistency proof")
+		}
+	} else if record.ConsistencyProof == nil || !mmr.VerifyConsistency(
+		rootFromPeaks(record.PrevPeaks), rootFromPeaks(record.NewPeaks), *record.ConsistencyProof,
+	) {
+		return Record{}, fmt.Errorf("checkpoint consistency proof is invalid")
+	}
+	if _, err := record.Payload().canonicalFields(); err != nil {
+		return Record{}, err
 	}
 	return record, nil
 }
@@ -200,16 +271,16 @@ func (r Record) VerifySignature() error {
 	if err != nil || len(public) != ed25519.PublicKeySize {
 		return fmt.Errorf("invalid checkpoint public key")
 	}
-	signature, err := hex.DecodeString(r.Signature)
-	if err != nil || len(signature) != ed25519.SignatureSize {
-		return fmt.Errorf("invalid checkpoint signature")
+	var message cose.Sign1Message
+	if err := message.UnmarshalCBOR(r.statement); err != nil {
+		return fmt.Errorf("decode checkpoint signature: %w", err)
 	}
-	digestHex, err := r.Payload().DigestHex()
+	verifier, err := cose.NewVerifier(cose.AlgorithmEdDSA, ed25519.PublicKey(public))
 	if err != nil {
 		return err
 	}
-	if !ed25519.Verify(ed25519.PublicKey(public), []byte(digestHex), signature) {
-		return fmt.Errorf("verify checkpoint signature")
+	if err := message.Verify(nil, verifier); err != nil {
+		return fmt.Errorf("verify checkpoint signature: %w", err)
 	}
 	return nil
 }
@@ -233,7 +304,7 @@ func NewEd25519Signer(private ed25519.PrivateKey) (*Ed25519Signer, error) {
 
 func (s *Ed25519Signer) KeyID() string { return hex.EncodeToString(s.public) }
 
-func (s *Ed25519Signer) SignCheckpoint(ctx context.Context, payload []byte) ([]byte, error) {
+func (s *Ed25519Signer) SignCheckpoint(ctx context.Context, payload []byte, newPeaks, prevPeaks [][]byte, proof *mmr.ConsistencyProof) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -241,14 +312,30 @@ func (s *Ed25519Signer) SignCheckpoint(ctx context.Context, payload []byte) ([]b
 	if err != nil || parsed.KeyID != s.KeyID() {
 		return nil, fmt.Errorf("checkpoint payload key does not match signer")
 	}
-	digestHex, err := parsed.DigestHex()
+	claims, err := encodeWireClaims(parsed, newPeaks, prevPeaks, proof)
 	if err != nil {
 		return nil, err
 	}
-	record := Record{Version: 1, Kind: "mmr_checkpoint", LogID: parsed.LogID, MMRSize: parsed.MMRSize, Root: parsed.Root, PrevSize: parsed.PrevSize, PrevRoot: parsed.PrevRoot, KeyID: parsed.KeyID, Timestamp: parsed.Timestamp, Signature: hex.EncodeToString(ed25519.Sign(s.private, []byte(digestHex)))}
-	encoded, err := record.CanonicalJSON()
+	message := cose.NewSign1Message()
+	message.Headers.Protected.SetAlgorithm(cose.AlgorithmEdDSA)
+	message.Headers.Protected[cose.HeaderLabelContentType] = ContentType
+	message.Headers.Protected[cose.HeaderLabelKeyID] = append([]byte(nil), s.public...)
+	if _, err := message.Headers.Protected.SetCWTClaims(cose.CWTClaims{
+		cose.CWTClaimIssuer: parsed.LogID, cose.CWTClaimSubject: fmt.Sprintf("%s#%d", parsed.LogID, parsed.MMRSize),
+	}); err != nil {
+		return nil, fmt.Errorf("set checkpoint CWT claims: %w", err)
+	}
+	message.Payload = claims
+	signer, err := cose.NewSigner(cose.AlgorithmEdDSA, s.private)
 	if err != nil {
-		return nil, fmt.Errorf("encode signed checkpoint: %w", err)
+		return nil, err
+	}
+	if err := message.Sign(rand.Reader, nil, signer); err != nil {
+		return nil, fmt.Errorf("sign checkpoint COSE: %w", err)
+	}
+	encoded, err := message.MarshalCBOR()
+	if err != nil {
+		return nil, fmt.Errorf("encode checkpoint COSE: %w", err)
 	}
 	if err := s.VerifyCheckpoint(payload, encoded); err != nil {
 		return nil, fmt.Errorf("verify newly signed checkpoint: %w", err)
@@ -269,6 +356,161 @@ func (s *Ed25519Signer) VerifyCheckpoint(payload, statement []byte) error {
 		return fmt.Errorf("checkpoint payload mismatch")
 	}
 	return record.VerifySignature()
+}
+
+type wireClaims struct {
+	Kind             string                `cbor:"kind"`
+	LogSize          uint64                `cbor:"log_size"`
+	Commitment       []byte                `cbor:"commitment"`
+	PrevSize         uint64                `cbor:"prev_size"`
+	PrevCommitment   []byte                `cbor:"prev_commitment"`
+	IssuedAt         string                `cbor:"issued_at"`
+	Cadence          *uint64               `cbor:"cadence,omitempty"`
+	ConsistencyProof *wireConsistencyProof `cbor:"consistency_proof,omitempty"`
+}
+
+type wireConsistencyProof struct {
+	SizeA    uint64     `cbor:"size_a"`
+	SizeB    uint64     `cbor:"size_b"`
+	OldPeaks [][]byte   `cbor:"old_peaks"`
+	Witness  [][][]byte `cbor:"witness"`
+	NewPeaks [][]byte   `cbor:"new_peaks"`
+}
+
+var canonicalCBOR = func() cbor.EncMode {
+	mode, err := cbor.CanonicalEncOptions().EncMode()
+	if err != nil {
+		panic(err)
+	}
+	return mode
+}()
+
+func encodeWireClaims(payload Payload, newPeaks, prevPeaks [][]byte, proof *mmr.ConsistencyProof) ([]byte, error) {
+	if err := validatePeakCommitments(payload, newPeaks, prevPeaks); err != nil {
+		return nil, err
+	}
+	if payload.PrevSize == 0 && proof != nil {
+		return nil, fmt.Errorf("first checkpoint cannot carry a consistency proof")
+	}
+	if payload.PrevSize > 0 {
+		if proof == nil || proof.OldSize != payload.PrevSize || proof.NewSize != payload.MMRSize || !mmr.VerifyConsistency(
+			rootFromPeaks(prevPeaks), rootFromPeaks(newPeaks), *proof,
+		) {
+			return nil, fmt.Errorf("checkpoint consistency proof is required and must bridge the declared checkpoints")
+		}
+	}
+	newCommitment, err := canonicalCBOR.Marshal(newPeaks)
+	if err != nil {
+		return nil, err
+	}
+	previousCommitment := []byte{}
+	if payload.PrevSize > 0 {
+		previousCommitment, err = canonicalCBOR.Marshal(prevPeaks)
+		if err != nil {
+			return nil, err
+		}
+	}
+	claims := wireClaims{
+		Kind: wireKind, LogSize: payload.MMRSize, Commitment: newCommitment,
+		PrevSize: payload.PrevSize, PrevCommitment: previousCommitment,
+		IssuedAt: payload.Timestamp.UTC().Format(time.RFC3339Nano),
+	}
+	if proof != nil {
+		claims.ConsistencyProof = &wireConsistencyProof{
+			SizeA: proof.OldSize, SizeB: proof.NewSize, OldPeaks: clonePeaks(proof.OldPeaks),
+			Witness: cloneWitness(proof.Witness), NewPeaks: clonePeaks(proof.NewPeaks),
+		}
+	}
+	return canonicalCBOR.Marshal(claims)
+}
+
+func decodeWireClaims(data []byte) (wireClaims, error) {
+	var claims wireClaims
+	options := cbor.DecOptions{DupMapKey: cbor.DupMapKeyEnforcedAPF, IndefLength: cbor.IndefLengthForbidden}
+	mode, err := options.DecMode()
+	if err != nil {
+		return wireClaims{}, err
+	}
+	if err := mode.Unmarshal(data, &claims); err != nil {
+		return wireClaims{}, fmt.Errorf("decode checkpoint claims: %w", err)
+	}
+	encoded, err := canonicalCBOR.Marshal(claims)
+	if err != nil || !bytes.Equal(encoded, data) {
+		return wireClaims{}, fmt.Errorf("checkpoint claims are not canonical")
+	}
+	if claims.Kind != wireKind || claims.LogSize == 0 || len(claims.Commitment) == 0 || claims.IssuedAt == "" {
+		return wireClaims{}, fmt.Errorf("checkpoint claims are invalid")
+	}
+	return claims, nil
+}
+
+func decodeCommitment(data []byte, name string) ([][]byte, error) {
+	var peaks [][]byte
+	options := cbor.DecOptions{DupMapKey: cbor.DupMapKeyEnforcedAPF, IndefLength: cbor.IndefLengthForbidden}
+	mode, err := options.DecMode()
+	if err != nil {
+		return nil, err
+	}
+	if err := mode.Unmarshal(data, &peaks); err != nil {
+		return nil, fmt.Errorf("decode checkpoint %s: %w", name, err)
+	}
+	encoded, err := canonicalCBOR.Marshal(peaks)
+	if err != nil || !bytes.Equal(encoded, data) {
+		return nil, fmt.Errorf("checkpoint %s is not canonical", name)
+	}
+	for _, peak := range peaks {
+		if len(peak) != sha256.Size {
+			return nil, fmt.Errorf("checkpoint %s contains an invalid peak", name)
+		}
+	}
+	return peaks, nil
+}
+
+func validatePeakCommitments(payload Payload, newPeaks, prevPeaks [][]byte) error {
+	if len(newPeaks) == 0 || hex.EncodeToString(rootFromPeaks(newPeaks)) != payload.Root {
+		return fmt.Errorf("checkpoint peaks do not match root")
+	}
+	if payload.PrevSize == 0 {
+		if len(prevPeaks) != 0 {
+			return fmt.Errorf("first checkpoint cannot carry previous peaks")
+		}
+		return nil
+	}
+	if len(prevPeaks) == 0 || hex.EncodeToString(rootFromPeaks(prevPeaks)) != payload.PrevRoot {
+		return fmt.Errorf("checkpoint previous peaks do not match root")
+	}
+	return nil
+}
+
+func rootFromPeaks(peaks [][]byte) []byte {
+	return mmr.RootFromPeaks(peaks)
+}
+
+func clonePeaks(peaks [][]byte) [][]byte {
+	cloned := make([][]byte, len(peaks))
+	for index := range peaks {
+		cloned[index] = append([]byte(nil), peaks[index]...)
+	}
+	return cloned
+}
+
+func cloneWitness(witness [][][]byte) [][][]byte {
+	cloned := make([][][]byte, len(witness))
+	for index := range witness {
+		cloned[index] = clonePeaks(witness[index])
+	}
+	return cloned
+}
+
+func protectedCWTClaims(value any) (cose.CWTClaims, error) {
+	switch claims := value.(type) {
+	case cose.CWTClaims:
+		return claims, nil
+	case map[any]any:
+		return cose.CWTClaims(claims), nil
+	default:
+		return nil, fmt.Errorf("invalid CWT claims")
+	}
 }
 
 // Config defines entry, age, and overdue checkpoint thresholds.

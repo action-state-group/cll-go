@@ -31,7 +31,7 @@ func TestServiceOwnsAACVerificationAndCopiesRegistryExtensions(t *testing.T) {
 	// must not change verification behavior or introduce a data race.
 	delete(extensions["chain.relation"], relation)
 	capsule := capsuleWithRelation(t, relation)
-	record, err := service.Append(t.Context(), capsule)
+	record, err := service.Append(t.Context(), ledger.AdmissionUnsigned, capsule)
 	require.NoError(t, err)
 	require.NotContains(t, findingCodes(record.Verification.Findings), "unknown_registry_value")
 
@@ -49,7 +49,7 @@ func TestServiceOwnsAACVerificationAndCopiesRegistryExtensions(t *testing.T) {
 	tampered["capsule_id"] = "0000000000000000000000000000000000000000000000000000000000000000"
 	raw, err := json.Marshal(tampered)
 	require.NoError(t, err)
-	_, err = service.Append(t.Context(), raw)
+	_, err = service.Append(t.Context(), ledger.AdmissionUnsigned, raw)
 	require.ErrorIs(t, err, ledger.ErrInvalid)
 }
 
@@ -61,10 +61,28 @@ func TestServiceDefaultConfigUsesEmbeddedRegistry(t *testing.T) {
 	require.NoError(t, err)
 	raw, err := os.ReadFile("testdata/valid-v4.json")
 	require.NoError(t, err)
-	record, err := service.Append(t.Context(), raw)
+	record, err := service.Append(t.Context(), ledger.AdmissionUnsigned, raw)
 	require.NoError(t, err)
 	require.True(t, record.Verification.OK)
 	require.NotContains(t, findingCodes(record.Verification.Findings), "unknown_registry_value")
+}
+
+func TestServiceRequiresDeclaredModeAndDoesNotInferFromEnvelopePresence(t *testing.T) {
+	store, err := jsonl.Open(t.TempDir(), "explicit-admission-test")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	service, err := ledger.New(store, ledger.Config{})
+	require.NoError(t, err)
+	raw, err := os.ReadFile("testdata/valid-v4.json")
+	require.NoError(t, err)
+
+	_, err = service.Append(t.Context(), "", raw)
+	require.ErrorIs(t, err, ledger.ErrInvalid)
+	_, err = service.Append(t.Context(), ledger.AdmissionUnsigned, raw, []byte("envelope-presence-must-not-select-signed"))
+	require.ErrorIs(t, err, ledger.ErrAdmission)
+	records, err := store.ScanIDs(t.Context(), 0, 1)
+	require.NoError(t, err)
+	require.Empty(t, records)
 }
 
 func TestAuditBounds(t *testing.T) {
@@ -74,7 +92,7 @@ func TestAuditBounds(t *testing.T) {
 	service, err := ledger.New(store, ledger.Config{})
 	require.NoError(t, err)
 	first := mutatedCapsule(t, func(map[string]any) {})
-	_, err = service.Append(t.Context(), first)
+	_, err = service.Append(t.Context(), ledger.AdmissionUnsigned, first)
 	require.NoError(t, err)
 
 	// The largest documented bound is valid even though Store.Scan itself is
@@ -86,7 +104,7 @@ func TestAuditBounds(t *testing.T) {
 	second := mutatedCapsule(t, func(capsule map[string]any) {
 		capsule["action_id"] = "v4-chain-second"
 	})
-	_, err = service.Append(t.Context(), second)
+	_, err = service.Append(t.Context(), ledger.AdmissionUnsigned, second)
 	require.NoError(t, err)
 	audit, err = service.Audit(t.Context(), 2)
 	require.NoError(t, err)

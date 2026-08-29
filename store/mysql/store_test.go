@@ -2,7 +2,9 @@ package mysql
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"os"
 	"testing"
 	"time"
@@ -18,12 +20,14 @@ import (
 func TestStoreContract(t *testing.T) {
 	dsn, terminate := startMySQL(t)
 	t.Cleanup(terminate)
-	storetest.Run(t, func(t *testing.T, logID string) ledger.Store {
+	open := func(t *testing.T, logID string) ledger.Store {
 		store, err := Open(t.Context(), dsn, logID)
 		require.NoError(t, err)
 		t.Cleanup(func() { require.NoError(t, store.Close()) })
 		return store
-	})
+	}
+	storetest.Run(t, open)
+	storetest.RunAdmission(t, open)
 }
 
 func TestCLLStoreContract(t *testing.T) {
@@ -54,10 +58,11 @@ func TestStoreLifecycleAndLogIsolation(t *testing.T) {
 	first, err := Open(t.Context(), dsn, "first")
 	require.NoError(t, err)
 	input := ledger.AppendInput{
-		CapsuleID:  ledger.CapsuleID("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-		Capsule:    []byte(`{"v":4}`),
-		ParentID:   ledger.CapsuleID("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
-		AppendedAt: time.Date(2026, 8, 25, 1, 2, 3, 0, time.UTC),
+		CapsuleID:    ledger.CapsuleID("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+		Capsule:      []byte(`{"v":4}`),
+		Authenticity: ledger.AuthenticityUnsigned,
+		ParentID:     ledger.CapsuleID("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+		AppendedAt:   time.Date(2026, 8, 25, 1, 2, 3, 0, time.UTC),
 	}
 	record, outcome, err := first.Append(t.Context(), input)
 	require.NoError(t, err)
@@ -89,7 +94,7 @@ func TestStoreLifecycleAndLogIsolation(t *testing.T) {
 
 	db, err := sql.Open("mysql", dsn)
 	require.NoError(t, err)
-	_, err = db.ExecContext(t.Context(), `UPDATE schema_metadata SET version=1 WHERE singleton=1`)
+	_, err = db.ExecContext(t.Context(), `UPDATE schema_metadata SET version=2 WHERE singleton=1`)
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 	_, err = Open(t.Context(), dsn, "first")
@@ -120,4 +125,26 @@ func TestClassifyRetryableMySQLErrors(t *testing.T) {
 		err := classify(&mysqlDriver.MySQLError{Number: number, Message: "retry"})
 		require.ErrorIs(t, err, ledger.ErrRetryable)
 	}
+}
+
+func TestGetRejectsSignedRecordWithStrippedEnvelope(t *testing.T) {
+	dsn, terminate := startMySQL(t)
+	t.Cleanup(terminate)
+	store, err := Open(t.Context(), dsn, "stripped")
+	require.NoError(t, err)
+	now := time.Now().UTC()
+	envelopeBytes := []byte("signed-envelope")
+	digest := sha256.Sum256(envelopeBytes)
+	id := ledger.CapsuleID("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	_, _, err = store.Append(t.Context(), ledger.AppendInput{
+		CapsuleID: id, Capsule: []byte(`{"v":4}`), Authenticity: ledger.AuthenticitySigned, AppendedAt: now,
+		Envelopes: []ledger.Envelope{{Digest: ledger.EnvelopeDigest(hex.EncodeToString(digest[:])), Bytes: envelopeBytes, Verification: ledger.EnvelopeVerification{OK: true, PublicKey: make([]byte, 32)}, AddedAt: now}},
+	})
+	require.NoError(t, err)
+	_, err = store.db.ExecContext(t.Context(), `DELETE FROM envelopes WHERE log_id=? AND capsule_id=?`, "stripped", id)
+	require.NoError(t, err)
+	_, err = store.Get(t.Context(), id)
+	require.ErrorIs(t, err, ledger.ErrCorrupt)
+	require.ErrorContains(t, err, "signed record has no verified envelope")
+	require.NoError(t, store.Close())
 }

@@ -36,9 +36,10 @@ func TestClientUsesCheckpointOnlyEndpoint(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-				require.Equal(t, "/v1/checkpoint", request.URL.Path)
+				require.Equal(t, "/checkpoints", request.URL.Path)
 				require.Equal(t, http.MethodPost, request.Method)
-				require.Equal(t, "application/json", request.Header.Get("Content-Type"))
+				require.Equal(t, checkpoint.ContentType, request.Header.Get("Content-Type"))
+				require.Equal(t, "application/json", request.Header.Get("Accept"))
 				body, err := io.ReadAll(request.Body)
 				require.NoError(t, err)
 				require.True(t, bytes.Equal(statement, body))
@@ -123,12 +124,13 @@ func checkpointStatement(t *testing.T) []byte {
 	require.NoError(t, err)
 	signer, err := checkpoint.NewEd25519Signer(private)
 	require.NoError(t, err)
+	root := bytes.Repeat([]byte{0x02}, 32)
 	payload, err := (checkpoint.Payload{
-		LogID: "log", KeyID: signer.KeyID(), MMRSize: 1, Root: fmt.Sprintf("%064x", 2),
+		LogID: "log", KeyID: signer.KeyID(), MMRSize: 1, Root: fmt.Sprintf("%x", root),
 		Timestamp: time.Date(2026, 8, 25, 0, 0, 0, 0, time.UTC),
 	}).CanonicalJSON()
 	require.NoError(t, err)
-	statement, err := signer.SignCheckpoint(t.Context(), payload)
+	statement, err := signer.SignCheckpoint(t.Context(), payload, [][]byte{root}, nil, nil)
 	require.NoError(t, err)
 	return statement
 }

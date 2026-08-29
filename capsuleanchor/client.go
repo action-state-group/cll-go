@@ -80,18 +80,23 @@ func NewClient(baseURL string, client *http.Client, maxResponseBytes int64) (*Cl
 		copyClient.Timeout = DefaultRequestTimeout
 	}
 	copyClient.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	return &Client{endpoint: strings.TrimRight(baseURL, "/") + "/v1/checkpoint", http: &copyClient, maxBytes: maxResponseBytes}, nil
+	return &Client{endpoint: strings.TrimRight(baseURL, "/") + "/checkpoints", http: &copyClient, maxBytes: maxResponseBytes}, nil
 }
 
 func (c *Client) Submit(ctx context.Context, signedCheckpoint []byte) (Receipt, error) {
-	if _, err := checkpoint.ParseRecord(signedCheckpoint); err != nil {
+	record, err := checkpoint.ParseRecord(signedCheckpoint)
+	if err != nil {
+		return Receipt{}, err
+	}
+	if err := record.VerifySignature(); err != nil {
 		return Receipt{}, err
 	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(signedCheckpoint))
 	if err != nil {
 		return Receipt{}, err
 	}
-	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Content-Type", checkpoint.ContentType)
+	request.Header.Set("Accept", "application/json")
 	response, err := c.http.Do(request)
 	if err != nil {
 		return Receipt{}, err

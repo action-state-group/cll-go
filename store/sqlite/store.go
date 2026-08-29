@@ -17,7 +17,7 @@ import (
 	sqliteDriver "modernc.org/sqlite"
 )
 
-const schemaVersion = 2
+const schemaVersion = 3
 
 const schema = `
 PRAGMA journal_mode=WAL;
@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS capsules (
   seq INTEGER NOT NULL,
   capsule_id TEXT NOT NULL,
   capsule BLOB NOT NULL,
+  authenticity TEXT NOT NULL CHECK (authenticity IN ('unsigned','signed')),
   verification BLOB NOT NULL,
   parent_id TEXT NOT NULL,
   appended_at TEXT NOT NULL,
@@ -147,7 +148,7 @@ func (s *Store) Append(ctx context.Context, in ledger.AppendInput) (_ ledger.Rec
 		return ledger.Record{}, "", err
 	}
 	if existing, getErr := get(ctx, tx, s.logID, in.CapsuleID); getErr == nil {
-		if !bytes.Equal(existing.Capsule, in.Capsule) || !sameEnvelopes(existing.Envelopes, in.Envelopes) {
+		if existing.Authenticity != in.Authenticity || !bytes.Equal(existing.Capsule, in.Capsule) || !sameEnvelopes(existing.Envelopes, in.Envelopes) {
 			return ledger.Record{}, "", ledger.ErrConflict
 		}
 		return existing, ledger.AppendIdempotent, nil
@@ -162,8 +163,8 @@ func (s *Store) Append(ctx context.Context, in ledger.AppendInput) (_ ledger.Rec
 	if !active {
 		return ledger.Record{}, "", ledger.ErrConflict
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO capsules(log_id,seq,capsule_id,capsule,verification,parent_id,appended_at) VALUES(?,?,?,?,?,?,?)`,
-		s.logID, seq, in.CapsuleID, in.Capsule, verification, in.ParentID, in.AppendedAt.UTC().Format(time.RFC3339Nano)); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO capsules(log_id,seq,capsule_id,capsule,authenticity,verification,parent_id,appended_at) VALUES(?,?,?,?,?,?,?,?)`,
+		s.logID, seq, in.CapsuleID, in.Capsule, in.Authenticity, verification, in.ParentID, in.AppendedAt.UTC().Format(time.RFC3339Nano)); err != nil {
 		return ledger.Record{}, "", err
 	}
 	for _, envelope := range in.Envelopes {
@@ -177,7 +178,7 @@ func (s *Store) Append(ctx context.Context, in ledger.AppendInput) (_ ledger.Rec
 	if err := tx.Commit(); err != nil {
 		return ledger.Record{}, "", err
 	}
-	record := ledger.Record{Seq: seq, CapsuleID: in.CapsuleID, Capsule: clone(in.Capsule), Envelopes: cloneEnvelopes(in.Envelopes), Verification: in.Verification.Clone(), ParentID: in.ParentID, AppendedAt: ledger.NormalizeTime(in.AppendedAt)}
+	record := ledger.Record{Seq: seq, CapsuleID: in.CapsuleID, Capsule: clone(in.Capsule), Authenticity: in.Authenticity, Envelopes: cloneEnvelopes(in.Envelopes), Verification: in.Verification.Clone(), ParentID: in.ParentID, AppendedAt: ledger.NormalizeTime(in.AppendedAt)}
 	return record.Clone(), ledger.AppendInserted, nil
 }
 
@@ -272,7 +273,7 @@ func get(ctx context.Context, q queryer, logID string, id ledger.CapsuleID) (led
 	var verification []byte
 	var parent string
 	var appended string
-	err := q.QueryRowContext(ctx, `SELECT seq,capsule_id,capsule,verification,parent_id,appended_at FROM capsules WHERE log_id=? AND capsule_id=?`, logID, id).Scan(&record.Seq, &record.CapsuleID, &record.Capsule, &verification, &parent, &appended)
+	err := q.QueryRowContext(ctx, `SELECT seq,capsule_id,capsule,authenticity,verification,parent_id,appended_at FROM capsules WHERE log_id=? AND capsule_id=?`, logID, id).Scan(&record.Seq, &record.CapsuleID, &record.Capsule, &record.Authenticity, &verification, &parent, &appended)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ledger.Record{}, ledger.ErrNotFound
 	}
@@ -308,6 +309,9 @@ func get(ctx context.Context, q queryer, logID string, id ledger.CapsuleID) (led
 	}
 	if err := rows.Err(); err != nil {
 		return ledger.Record{}, err
+	}
+	if err := record.Validate(); err != nil {
+		return ledger.Record{}, fmt.Errorf("decode stored record: %w: %v", ledger.ErrCorrupt, err)
 	}
 	return record, nil
 }
@@ -731,7 +735,7 @@ func (s *Store) Rebaseline(ctx context.Context, input ledger.RebaselineInput) (_
 	if _, err := tx.ExecContext(ctx, `INSERT INTO ledger_metadata(log_id,next_seq,indexed_seq,first_uncheckpointed,active,force_checkpoint) VALUES(?,?,?,?,1,1)`, input.NewLogID, next, indexed, first); err != nil {
 		return ledger.RebaselineRecord{}, err
 	}
-	for _, statement := range []string{`INSERT INTO capsules SELECT ?,seq,capsule_id,capsule,verification,parent_id,appended_at FROM capsules WHERE log_id=?`, `INSERT INTO envelopes SELECT ?,capsule_id,digest,envelope,verification,added_at FROM envelopes WHERE log_id=?`, `INSERT INTO mmr_nodes SELECT ?,position,hash FROM mmr_nodes WHERE log_id=?`} {
+	for _, statement := range []string{`INSERT INTO capsules(log_id,seq,capsule_id,capsule,authenticity,verification,parent_id,appended_at) SELECT ?,seq,capsule_id,capsule,authenticity,verification,parent_id,appended_at FROM capsules WHERE log_id=?`, `INSERT INTO envelopes SELECT ?,capsule_id,digest,envelope,verification,added_at FROM envelopes WHERE log_id=?`, `INSERT INTO mmr_nodes SELECT ?,position,hash FROM mmr_nodes WHERE log_id=?`} {
 		if _, err := tx.ExecContext(ctx, statement, input.NewLogID, s.logID); err != nil {
 			return ledger.RebaselineRecord{}, err
 		}

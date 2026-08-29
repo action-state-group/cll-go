@@ -51,10 +51,35 @@ func TestBaggedConsistencyProofAcrossMultiPeakTrees(t *testing.T) {
 	proof, err := tree.ConsistencyProof(oldSize)
 	require.NoError(t, err)
 	require.True(t, VerifyConsistency(oldRoot, newRoot, proof))
-	if len(proof.Path) > 0 {
-		proof.Path[0][0] ^= 1
+	if len(proof.Witness) > 0 && len(proof.Witness[0]) > 0 {
+		proof.Witness[0][0][0] ^= 1
 		require.False(t, VerifyConsistency(oldRoot, newRoot, proof))
 	}
+}
+
+func TestPeakHashesAtReturnsHistoricalCommitment(t *testing.T) {
+	tree, err := New(nil)
+	require.NoError(t, err)
+	for index := 1; index <= 5; index++ {
+		_, err = tree.AppendCapsuleID(fmt.Sprintf("%064x", index))
+		require.NoError(t, err)
+	}
+
+	historicalSize := uint64(4)
+	peaks, err := tree.PeakHashesAt(historicalSize)
+	require.NoError(t, err)
+	require.NotEmpty(t, peaks)
+
+	historical, err := New(tree.Nodes()[:historicalSize])
+	require.NoError(t, err)
+	expected, err := historical.Root()
+	require.NoError(t, err)
+	require.Equal(t, expected, RootFromPeaks(peaks))
+
+	_, err = tree.PeakHashesAt(2)
+	require.Error(t, err)
+	_, err = tree.PeakHashesAt(tree.Size() + 1)
+	require.Error(t, err)
 }
 
 func TestEmptyRootAndAdversarialInputs(t *testing.T) {

@@ -48,9 +48,21 @@ func New(store Store, config Config) (*Service, error) {
 	}, nil
 }
 
-func (s *Service) Append(ctx context.Context, capsule []byte, envelopes ...[]byte) (Record, error) {
+// Append admits one Capsule under the caller's explicit authenticity mode.
+// Signed admission requires at least one valid Producer Envelope; unsigned
+// admission rejects envelopes rather than inferring or silently changing mode.
+func (s *Service) Append(ctx context.Context, mode AdmissionMode, capsule []byte, envelopes ...[]byte) (Record, error) {
+	if mode != AdmissionUnsigned && mode != AdmissionSigned {
+		return Record{}, fmt.Errorf("%w: admission mode must be unsigned or signed", ErrInvalid)
+	}
 	if len(envelopes) > MaxEnvelopesPerCapsule {
 		return Record{}, fmt.Errorf("%w: too many envelopes", ErrInvalid)
+	}
+	if mode == AdmissionUnsigned && len(envelopes) != 0 {
+		return Record{}, fmt.Errorf("%w: unsigned admission does not permit Producer Envelopes", ErrAdmission)
+	}
+	if mode == AdmissionSigned && len(envelopes) == 0 {
+		return Record{}, fmt.Errorf("%w: signed admission requires a Producer Envelope", ErrAdmission)
 	}
 	verification, id, err := s.verifier.VerifyCapsule(capsule)
 	if err != nil {
@@ -64,9 +76,9 @@ func (s *Service) Append(ctx context.Context, capsule []byte, envelopes ...[]byt
 	verifiedEnvelopes := make([]Envelope, 0, len(envelopes))
 	seen := make(map[EnvelopeDigest][]byte, len(envelopes))
 	for _, raw := range envelopes {
-		verification, err := s.verifier.VerifyEnvelope(id, raw)
-		if err != nil {
-			return Record{}, err
+		envelopeVerification, verifyErr := s.verifier.VerifyEnvelope(id, raw)
+		if verifyErr != nil {
+			return Record{}, fmt.Errorf("%w: Producer Envelope verification failed: %v", ErrAdmission, verifyErr)
 		}
 		digest := digestEnvelope(raw)
 		if previous, exists := seen[digest]; exists {
@@ -77,12 +89,16 @@ func (s *Service) Append(ctx context.Context, capsule []byte, envelopes ...[]byt
 		}
 		seen[digest] = cloneBytes(raw)
 		verifiedEnvelopes = append(verifiedEnvelopes, Envelope{
-			Digest: digest, Bytes: cloneBytes(raw), Verification: verification,
+			Digest: digest, Bytes: cloneBytes(raw), Verification: envelopeVerification,
 			AddedAt: appendedAt,
 		})
 	}
+	authenticity := AuthenticityUnsigned
+	if mode == AdmissionSigned {
+		authenticity = AuthenticitySigned
+	}
 	record, _, err := s.store.Append(ctx, AppendInput{
-		CapsuleID: id, Capsule: cloneBytes(capsule), Envelopes: verifiedEnvelopes,
+		CapsuleID: id, Capsule: cloneBytes(capsule), Authenticity: authenticity, Envelopes: verifiedEnvelopes,
 		Verification: verification, ParentID: parentID, AppendedAt: appendedAt,
 	})
 	return record, err

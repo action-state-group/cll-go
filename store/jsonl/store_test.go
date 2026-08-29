@@ -1,7 +1,11 @@
 package jsonl
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -15,12 +19,20 @@ import (
 )
 
 func TestStoreContract(t *testing.T) {
-	storetest.Run(t, func(t *testing.T, logID string) ledger.Store {
-		store, err := Open(t.TempDir(), logID)
+	roots := make(map[string]string)
+	open := func(t *testing.T, logID string) ledger.Store {
+		root, exists := roots[logID]
+		if !exists {
+			root = t.TempDir()
+			roots[logID] = root
+		}
+		store, err := Open(root, logID)
 		require.NoError(t, err)
 		t.Cleanup(func() { require.NoError(t, store.Close()) })
 		return store
-	})
+	}
+	storetest.Run(t, open)
+	storetest.RunAdmission(t, open)
 }
 
 func TestCLLValidationHasNoStateEffectsBeforeJournalCommit(t *testing.T) {
@@ -64,8 +76,9 @@ func TestStoreAppendEnvelopeRestartAndGap(t *testing.T) {
 
 	input := ledger.AppendInput{
 		CapsuleID: testID, Capsule: []byte(`{"capsule_id":"one"}`),
-		ParentID:   ledger.CapsuleID("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-		AppendedAt: time.Date(2026, 8, 25, 0, 0, 0, 0, time.UTC),
+		Authenticity: ledger.AuthenticityUnsigned,
+		ParentID:     ledger.CapsuleID("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+		AppendedAt:   time.Date(2026, 8, 25, 0, 0, 0, 0, time.UTC),
 	}
 	record, outcome, err := store.Append(t.Context(), input)
 	require.NoError(t, err)
@@ -126,7 +139,7 @@ func TestStoreTruncatesUnterminatedTailButRejectsEarlierCorruption(t *testing.T)
 	root := t.TempDir()
 	store, err := Open(root, "test-log")
 	require.NoError(t, err)
-	_, _, err = store.Append(t.Context(), ledger.AppendInput{CapsuleID: testID, Capsule: []byte("capsule"), AppendedAt: time.Now().UTC()})
+	_, _, err = store.Append(t.Context(), ledger.AppendInput{CapsuleID: testID, Capsule: []byte("capsule"), Authenticity: ledger.AuthenticityUnsigned, AppendedAt: time.Now().UTC()})
 	require.NoError(t, err)
 	require.NoError(t, store.Close())
 
@@ -150,14 +163,48 @@ func TestStoreTruncatesUnterminatedTailButRejectsEarlierCorruption(t *testing.T)
 	require.Nil(t, failed)
 }
 
-func TestOpenRejectsVersionOneJournal(t *testing.T) {
+func TestOpenRejectsVersionTwoJournal(t *testing.T) {
 	root := t.TempDir()
-	record := []byte("{\"version\":1,\"type\":\"log.init\",\"log_id\":\"test-log\"}\n")
+	record := []byte("{\"version\":2,\"type\":\"log.init\",\"log_id\":\"test-log\"}\n")
 	require.NoError(t, os.WriteFile(filepath.Join(root, journalName), record, 0o600))
 
 	store, err := Open(root, "test-log")
 	require.ErrorIs(t, err, ledger.ErrCorrupt)
 	require.Nil(t, store)
+}
+
+func TestOpenRejectsSignedRecordWithStrippedEnvelope(t *testing.T) {
+	root := t.TempDir()
+	store, err := Open(root, "stripped")
+	require.NoError(t, err)
+	now := time.Now().UTC()
+	envelopeBytes := []byte("signed-envelope")
+	digest := sha256.Sum256(envelopeBytes)
+	id := ledger.CapsuleID("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	_, _, err = store.Append(t.Context(), ledger.AppendInput{
+		CapsuleID: id, Capsule: []byte(`{"v":4}`), Authenticity: ledger.AuthenticitySigned, AppendedAt: now,
+		Envelopes: []ledger.Envelope{{Digest: ledger.EnvelopeDigest(hex.EncodeToString(digest[:])), Bytes: envelopeBytes, Verification: ledger.EnvelopeVerification{OK: true, PublicKey: make([]byte, 32)}, AddedAt: now}},
+	})
+	require.NoError(t, err)
+	require.NoError(t, store.Close())
+
+	path := filepath.Join(root, journalName)
+	raw, err := os.ReadFile(path)
+	require.NoError(t, err)
+	lines := bytes.Split(bytes.TrimSpace(raw), []byte("\n"))
+	for index := range lines {
+		var item event
+		require.NoError(t, json.Unmarshal(lines[index], &item))
+		if item.Record != nil {
+			item.Record.Envelopes = nil
+			lines[index], err = json.Marshal(item)
+			require.NoError(t, err)
+		}
+	}
+	require.NoError(t, os.WriteFile(path, append(bytes.Join(lines, []byte("\n")), '\n'), 0o600))
+	_, err = Open(root, "stripped")
+	require.ErrorIs(t, err, ledger.ErrCorrupt)
+	require.ErrorContains(t, err, "signed record has no verified envelope")
 }
 
 func TestStoreHonorsCanceledContext(t *testing.T) {
@@ -209,7 +256,7 @@ func TestStoreRebaselineRebindsJournal(t *testing.T) {
 	store, err := Open(root, "old-log")
 	require.NoError(t, err)
 	created := time.Now().UTC()
-	_, _, err = store.Append(t.Context(), ledger.AppendInput{CapsuleID: testID, Capsule: []byte("capsule"), AppendedAt: created})
+	_, _, err = store.Append(t.Context(), ledger.AppendInput{CapsuleID: testID, Capsule: []byte("capsule"), Authenticity: ledger.AuthenticityUnsigned, AppendedAt: created})
 	require.NoError(t, err)
 	checkpoint := ledger.CheckpointRecord{IndexedSeq: 1, MMRSize: 1, Root: fmt.Sprintf("%064x", 1), Payload: []byte("payload"), SignedCheckpoint: []byte("statement"), CreatedAt: created}
 	require.NoError(t, store.CommitCLL(t.Context(), ledger.CLLMutation{IndexedSeq: 1, Nodes: []ledger.MMRNode{{Position: 0, Hash: make([]byte, 32)}}, Checkpoint: &checkpoint, WitnessIDs: []string{"anchor"}}))

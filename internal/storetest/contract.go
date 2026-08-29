@@ -2,15 +2,22 @@
 package storetest
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/action-state-group/agent-action-capsule/go/canonical"
 	"github.com/ethanyzhang/capsule-ledger-go/ledger"
+	producer "github.com/ethanyzhang/capsule-producer-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+const validCapsule = `{"action_id":"v4-chain","action_type":"decide","assurance":{"attestation_mode":"self_attested","effect_mode":"not_applicable","ledger_mode":"chained"},"canonicalization_id":"jcs","capsule_id":"862024869f00481bb4f59d9528a45c2d4885f64c5222a9324a38ac2c2cd119f2","chain":{"parent_capsule_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","relation":"confirms"},"constraints":[],"developer":"agent@v1","disposition":{"approver":"policy","decision":"accept","human_disposed":false,"verdict_class":"executed"},"format_version":"4","operator":"ACME-CO","spec_version":"draft-mih-scitt-agent-action-capsule-04","timestamp":"2026-08-24T00:00:00Z"}`
 
 type Factory func(t *testing.T, logID string) ledger.Store
 type CLLFactory func(t *testing.T, logID string) ledger.CLLStore
@@ -150,6 +157,109 @@ func Run(t *testing.T, open Factory) {
 	})
 }
 
+// RunAdmission applies the five shared Python/Go admission cases to a Store
+// backend through the public Service boundary.
+func RunAdmission(t *testing.T, open Factory) {
+	t.Helper()
+	capsule := []byte(validCapsule)
+	validEnvelope := producerEnvelope(t, capsule)
+	wrongCapsule := mutateCapsule(t, capsule, "v4-chain-wrong-envelope")
+	wrongEnvelope := producerEnvelope(t, wrongCapsule)
+
+	t.Run("declared unsigned records explicit state", func(t *testing.T) {
+		store := open(t, "admission-unsigned")
+		service, err := ledger.New(store, ledger.Config{})
+		require.NoError(t, err)
+		record, err := service.Append(t.Context(), ledger.AdmissionUnsigned, capsule)
+		require.NoError(t, err)
+		assert.Equal(t, ledger.AuthenticityUnsigned, record.Authenticity)
+		assert.Empty(t, record.Envelopes)
+	})
+
+	t.Run("declared signed missing envelope rejects before mutation", func(t *testing.T) {
+		store := open(t, "admission-missing")
+		service, err := ledger.New(store, ledger.Config{})
+		require.NoError(t, err)
+		_, err = service.Append(t.Context(), ledger.AdmissionSigned, capsule)
+		require.ErrorIs(t, err, ledger.ErrAdmission)
+		assertEmptyStore(t, store)
+	})
+
+	t.Run("declared signed invalid envelope rejects before mutation", func(t *testing.T) {
+		store := open(t, "admission-invalid")
+		service, err := ledger.New(store, ledger.Config{})
+		require.NoError(t, err)
+		_, err = service.Append(t.Context(), ledger.AdmissionSigned, capsule, wrongEnvelope)
+		require.ErrorIs(t, err, ledger.ErrAdmission)
+		assertEmptyStore(t, store)
+	})
+
+	t.Run("declared signed mixed valid and invalid envelopes rejects before mutation", func(t *testing.T) {
+		store := open(t, "admission-mixed")
+		service, err := ledger.New(store, ledger.Config{})
+		require.NoError(t, err)
+		_, err = service.Append(t.Context(), ledger.AdmissionSigned, capsule, validEnvelope, wrongEnvelope)
+		require.ErrorIs(t, err, ledger.ErrAdmission)
+		require.ErrorIs(t, err, ledger.ErrInvalid)
+		assertEmptyStore(t, store)
+	})
+
+	t.Run("declared signed valid envelope persists and reverifies", func(t *testing.T) {
+		const logID = "admission-valid"
+		store := open(t, logID)
+		service, err := ledger.New(store, ledger.Config{})
+		require.NoError(t, err)
+		record, err := service.Append(t.Context(), ledger.AdmissionSigned, capsule, validEnvelope)
+		require.NoError(t, err)
+		assert.Equal(t, ledger.AuthenticitySigned, record.Authenticity)
+		require.Len(t, record.Envelopes, 1)
+		assert.Equal(t, validEnvelope, record.Envelopes[0].Bytes)
+		require.NoError(t, store.Close())
+		reopened := open(t, logID)
+		stored, err := reopened.Get(t.Context(), record.CapsuleID)
+		require.NoError(t, err)
+		require.Len(t, stored.Envelopes, 1)
+		verification, err := (ledger.AACVerifier{}).VerifyEnvelope(stored.CapsuleID, stored.Envelopes[0].Bytes)
+		require.NoError(t, err)
+		assert.True(t, verification.OK)
+		assert.Equal(t, stored.Envelopes[0].Verification.PublicKey, verification.PublicKey)
+	})
+
+}
+
+func assertEmptyStore(t *testing.T, store ledger.Store) {
+	t.Helper()
+	entries, err := store.ScanIDs(t.Context(), 0, 1)
+	require.NoError(t, err)
+	assert.Empty(t, entries)
+}
+
+func producerEnvelope(t *testing.T, capsule []byte) []byte {
+	t.Helper()
+	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	identity, err := producer.NewEd25519SigningIdentity(privateKey)
+	require.NoError(t, err)
+	_, capsuleID, err := (ledger.AACVerifier{}).VerifyCapsule(capsule)
+	require.NoError(t, err)
+	envelope, err := producer.Sign(producer.BuiltPayload{CapsuleID: string(capsuleID), JSON: capsule}, identity)
+	require.NoError(t, err)
+	return envelope
+}
+
+func mutateCapsule(t *testing.T, capsule []byte, actionID string) []byte {
+	t.Helper()
+	var value map[string]any
+	require.NoError(t, json.Unmarshal(capsule, &value))
+	value["action_id"] = actionID
+	id, err := canonical.ComputeCapsuleID(value)
+	require.NoError(t, err)
+	value["capsule_id"] = id
+	encoded, err := json.Marshal(value)
+	require.NoError(t, err)
+	return encoded
+}
+
 func RunCLL(t *testing.T, open CLLFactory) {
 	t.Helper()
 	store := open(t, "contract-cll")
@@ -237,6 +347,7 @@ func appendInput(number int) ledger.AppendInput {
 	return ledger.AppendInput{
 		CapsuleID:    capsuleID(number),
 		Capsule:      []byte(fmt.Sprintf(`{"capsule":%d}`, number)),
+		Authenticity: ledger.AuthenticityUnsigned,
 		Verification: ledger.VerificationResult{OK: true, CapsuleID: capsuleID(number), Assurance: map[string]string{"effect_mode": "confirmed"}, Findings: []ledger.Finding{{Code: "test", Check: &check}}},
 		AppendedAt:   time.Date(2026, 8, 25, 1, 2, number%60, 0, time.UTC),
 	}

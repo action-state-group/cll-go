@@ -127,7 +127,7 @@ func PublishInvestigation(
     }
 
     // Verify exact Capsule and Envelope bytes, allocate seq, and persist them.
-    record, err := service.Append(ctx, produced.Payload, produced.Envelope)
+    record, err := service.Append(ctx, ledger.AdmissionSigned, produced.Payload, produced.Envelope)
     if err != nil {
         return err
     }
@@ -214,7 +214,7 @@ ledger.Service.Append
 checkpoint.Runner.RunOnce
     -> durable CLL/MMR checkpoint + pending delivery
 capsuleanchor.DeliveryRunner.RunOnce
-    -> POST /v1/checkpoint
+    -> POST /checkpoints (raw COSE_Sign1)
     -> offline receipt verification
     -> durable verified witness result
 ```
@@ -222,7 +222,8 @@ capsuleanchor.DeliveryRunner.RunOnce
 The client accepts only the deployed checkpoint-only request and response
 profile. The witness verifies the checkpoint's self-contained Ed25519
 signature and returns an RFC 9162 receipt. It is stateless across checkpoints,
-so the receipt proves checkpoint registration and time, not stream continuity.
+so the receipt proves checkpoint registration and inclusion, not stream
+continuity or an independently attested time.
 See the [witness contract](DESIGN.md#witness-rest-and-trust) for the exact hash
 rules.
 

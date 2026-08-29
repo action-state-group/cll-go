@@ -115,7 +115,7 @@ type tamperedCheckpointStore struct{ ledger.CheckpointStore }
 func (s tamperedCheckpointStore) LoadCLL(ctx context.Context) (ledger.CLLState, error) {
 	state, err := s.CheckpointStore.LoadCLL(ctx)
 	if err == nil && len(state.Checkpoints) > 0 {
-		state.Checkpoints[0].SignedCheckpoint[0] ^= 1
+		state.Checkpoints[0].SignedCheckpoint[len(state.Checkpoints[0].SignedCheckpoint)-1] ^= 1
 	}
 	return state, err
 }
@@ -136,9 +136,10 @@ func appendCapsules(t *testing.T, store ledger.Store, started time.Time, count i
 	t.Helper()
 	for number := 1; number <= count; number++ {
 		_, _, err := store.Append(t.Context(), ledger.AppendInput{
-			CapsuleID:  ledger.CapsuleID(fmt.Sprintf("%064x", number)),
-			Capsule:    []byte(fmt.Sprintf(`{"capsule":%d}`, number)),
-			AppendedAt: started.Add(time.Duration(number-1) * time.Second),
+			CapsuleID:    ledger.CapsuleID(fmt.Sprintf("%064x", number)),
+			Capsule:      []byte(fmt.Sprintf(`{"capsule":%d}`, number)),
+			Authenticity: ledger.AuthenticityUnsigned,
+			AppendedAt:   started.Add(time.Duration(number-1) * time.Second),
 		})
 		require.NoError(t, err)
 	}

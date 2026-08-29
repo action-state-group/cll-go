@@ -1,6 +1,7 @@
 package ledger
 
 import (
+	"crypto/ed25519"
 	"fmt"
 	"time"
 )
@@ -46,6 +47,23 @@ type CapsuleID string
 
 // EnvelopeDigest identifies exact Producer Envelope bytes.
 type EnvelopeDigest string
+
+// AdmissionMode is the caller-declared authenticity requirement for append.
+// Envelope presence never selects the mode.
+type AdmissionMode string
+
+const (
+	AdmissionUnsigned AdmissionMode = "unsigned"
+	AdmissionSigned   AdmissionMode = "signed"
+)
+
+// Authenticity is the immutable admission result persisted with a Record.
+type Authenticity string
+
+const (
+	AuthenticityUnsigned Authenticity = "unsigned"
+	AuthenticitySigned   Authenticity = "signed"
+)
 
 // Finding preserves an upstream structured verification finding.
 type Finding struct {
@@ -110,10 +128,56 @@ type Record struct {
 	Seq          uint64             `json:"seq"`
 	CapsuleID    CapsuleID          `json:"capsule_id"`
 	Capsule      []byte             `json:"capsule"`
+	Authenticity Authenticity       `json:"authenticity"`
 	Envelopes    []Envelope         `json:"envelopes,omitempty"`
 	Verification VerificationResult `json:"verification"`
 	ParentID     CapsuleID          `json:"parent_capsule_id,omitempty"`
 	AppendedAt   time.Time          `json:"appended_at"`
+}
+
+// Validate checks that a stored record contains a complete explicit admission
+// result and the evidence required by that result.
+func (r Record) Validate() error {
+	if r.Seq == 0 {
+		return fmt.Errorf("%w: invalid record sequence", ErrInvalid)
+	}
+	if !validID(r.CapsuleID) || len(r.Capsule) == 0 || len(r.Capsule) > MaxCapsuleBytes || r.AppendedAt.IsZero() {
+		return fmt.Errorf("%w: invalid stored record identity, size, or timestamp", ErrInvalid)
+	}
+	if r.ParentID != "" && !validID(r.ParentID) {
+		return fmt.Errorf("%w: invalid stored parent capsule id", ErrInvalid)
+	}
+	if r.Verification.CapsuleID != "" && r.Verification.CapsuleID != r.CapsuleID {
+		return fmt.Errorf("%w: stored verification capsule id mismatch", ErrInvalid)
+	}
+	if len(r.Envelopes) > MaxEnvelopesPerCapsule {
+		return fmt.Errorf("%w: too many stored envelopes", ErrInvalid)
+	}
+	verified := 0
+	seen := make(map[EnvelopeDigest]struct{}, len(r.Envelopes))
+	for _, envelope := range r.Envelopes {
+		if err := envelope.validate(); err != nil {
+			return err
+		}
+		if _, exists := seen[envelope.Digest]; exists {
+			return fmt.Errorf("%w: duplicate stored envelope", ErrInvalid)
+		}
+		seen[envelope.Digest] = struct{}{}
+		if envelope.Verification.OK && len(envelope.Verification.PublicKey) == ed25519.PublicKeySize {
+			verified++
+		}
+	}
+	switch r.Authenticity {
+	case AuthenticityUnsigned:
+		return nil
+	case AuthenticitySigned:
+		if verified == 0 {
+			return fmt.Errorf("%w: signed record has no verified envelope", ErrInvalid)
+		}
+		return nil
+	default:
+		return fmt.Errorf("%w: stored record lacks explicit authenticity", ErrInvalid)
+	}
 }
 
 // Clone returns a fully independent Record value.
@@ -188,6 +252,7 @@ const (
 type AppendInput struct {
 	CapsuleID    CapsuleID
 	Capsule      []byte
+	Authenticity Authenticity
 	Envelopes    []Envelope
 	Verification VerificationResult
 	ParentID     CapsuleID
@@ -241,6 +306,23 @@ func (in AppendInput) Validate() error {
 			return fmt.Errorf("%w: duplicate initial envelope", ErrInvalid)
 		}
 		seen[envelope.Digest] = struct{}{}
+	}
+	switch in.Authenticity {
+	case AuthenticityUnsigned:
+		if len(in.Envelopes) != 0 {
+			return fmt.Errorf("%w: unsigned authenticity cannot carry initial envelopes", ErrInvalid)
+		}
+	case AuthenticitySigned:
+		if len(in.Envelopes) == 0 {
+			return fmt.Errorf("%w: signed authenticity requires a verified envelope", ErrInvalid)
+		}
+		for _, envelope := range in.Envelopes {
+			if !envelope.Verification.OK || len(envelope.Verification.PublicKey) != ed25519.PublicKeySize {
+				return fmt.Errorf("%w: signed authenticity requires verified envelope evidence", ErrInvalid)
+			}
+		}
+	default:
+		return fmt.Errorf("%w: explicit authenticity is required", ErrInvalid)
 	}
 	return nil
 }

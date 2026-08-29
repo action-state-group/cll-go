@@ -24,7 +24,8 @@ type ConsistencyProof struct {
 	OldSize  uint64
 	NewSize  uint64
 	OldPeaks [][]byte
-	Path     [][]byte
+	Witness  [][][]byte
+	NewPeaks [][]byte
 }
 
 // New restores a Tree from its complete ordered node sequence.
@@ -98,6 +99,25 @@ func (t *Tree) Root() ([]byte, error) {
 	return append([]byte(nil), root...), nil
 }
 
+// PeakHashesAt returns the ordered accumulator peaks at a complete historical
+// MMR size. The order is tallest-to-smallest, matching the MMR commitment
+// object carried by the CLL checkpoint COSE wire profile.
+func (t *Tree) PeakHashesAt(size uint64) ([][]byte, error) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if size == 0 {
+		return [][]byte{}, nil
+	}
+	if size > uint64(len(t.nodes)) || !validMMRSize(size) {
+		return nil, fmt.Errorf("invalid historical MMR size %d", size)
+	}
+	peaks, err := dtmmr.PeakHashes((*nodeStore)(t), size-1)
+	if err != nil {
+		return nil, fmt.Errorf("read MMR peaks at size %d: %w", size, err)
+	}
+	return cloneProof(peaks), nil
+}
+
 func (t *Tree) InclusionProof(leafIndex uint64) ([][]byte, error) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
@@ -120,30 +140,152 @@ func (t *Tree) ConsistencyProof(oldSize uint64) (ConsistencyProof, error) {
 	if oldSize == 0 || oldSize > newSize || !validMMRSize(oldSize) || !validMMRSize(newSize) {
 		return ConsistencyProof{}, fmt.Errorf("invalid MMR consistency sizes")
 	}
-	proof, err := dtmmr.IndexConsistencyProofBagged(oldSize, newSize, (*nodeStore)(t), sha256.New())
-	if err != nil {
-		return ConsistencyProof{}, fmt.Errorf("create bagged consistency proof: %w", err)
-	}
-	peaks, err := dtmmr.PeakHashes((*nodeStore)(t), oldSize-1)
+	oldPositions := dtmmr.Peaks(oldSize - 1)
+	newPositions := dtmmr.Peaks(newSize - 1)
+	oldPeaks, err := dtmmr.PeakHashes((*nodeStore)(t), oldSize-1)
 	if err != nil {
 		return ConsistencyProof{}, fmt.Errorf("read old MMR peaks: %w", err)
 	}
-	return ConsistencyProof{OldSize: oldSize, NewSize: newSize, OldPeaks: cloneProof(peaks), Path: cloneProof(proof.PathBagged)}, nil
+	newPeaks, err := dtmmr.PeakHashes((*nodeStore)(t), newSize-1)
+	if err != nil {
+		return ConsistencyProof{}, fmt.Errorf("read new MMR peaks: %w", err)
+	}
+	witness := make([][][]byte, len(oldPositions))
+	for index, oldPeak := range oldPositions {
+		containing := containingPeak(oldPeak, newPositions)
+		if containing < 0 {
+			return ConsistencyProof{}, fmt.Errorf("old peak %d is not contained in new MMR", oldPeak)
+		}
+		steps, ok := pathToPeak(newPositions[containing], dtmmr.IndexHeight(newPositions[containing]), oldPeak)
+		if !ok {
+			return ConsistencyProof{}, fmt.Errorf("old peak %d has no path to new peak", oldPeak)
+		}
+		witness[index] = make([][]byte, len(steps))
+		for stepIndex, step := range steps {
+			witness[index][stepIndex] = append([]byte(nil), t.nodes[step.sibling]...)
+		}
+	}
+	return ConsistencyProof{OldSize: oldSize, NewSize: newSize, OldPeaks: cloneProof(oldPeaks), Witness: cloneWitness(witness), NewPeaks: cloneProof(newPeaks)}, nil
 }
 
-// VerifyConsistency validates a bagged append-only consistency proof.
+// VerifyConsistency validates the accumulator consistency proof carried by the
+// capsule-emit checkpoint COSE profile.
 func VerifyConsistency(oldRoot, newRoot []byte, proof ConsistencyProof) bool {
-	if len(oldRoot) != hashSize || len(newRoot) != hashSize || proof.OldSize == 0 || proof.OldSize > proof.NewSize || !validMMRSize(proof.OldSize) || !validMMRSize(proof.NewSize) || len(dtmmr.PosPeaks(proof.OldSize)) != len(proof.OldPeaks) {
+	if len(oldRoot) != hashSize || len(newRoot) != hashSize || proof.OldSize == 0 || proof.OldSize > proof.NewSize || !validMMRSize(proof.OldSize) || !validMMRSize(proof.NewSize) {
 		return false
 	}
-	for _, collection := range [][][]byte{proof.OldPeaks, proof.Path} {
+	oldPositions := dtmmr.Peaks(proof.OldSize - 1)
+	newPositions := dtmmr.Peaks(proof.NewSize - 1)
+	if len(proof.OldPeaks) != len(oldPositions) || len(proof.NewPeaks) != len(newPositions) || len(proof.Witness) != len(oldPositions) {
+		return false
+	}
+	for _, collection := range [][][]byte{proof.OldPeaks, proof.NewPeaks} {
 		for _, node := range collection {
 			if len(node) != hashSize {
 				return false
 			}
 		}
 	}
-	return dtmmr.VerifyConsistencyBagged(sha256.New(), proof.OldPeaks, dtmmr.ConsistencyProof{MMRSizeA: proof.OldSize, MMRSizeB: proof.NewSize, PathBagged: proof.Path}, oldRoot, newRoot)
+	if !bytes.Equal(RootFromPeaks(proof.OldPeaks), oldRoot) || !bytes.Equal(RootFromPeaks(proof.NewPeaks), newRoot) {
+		return false
+	}
+	for index, oldPeak := range oldPositions {
+		containing := containingPeak(oldPeak, newPositions)
+		if containing < 0 {
+			return false
+		}
+		steps, ok := pathToPeak(newPositions[containing], dtmmr.IndexHeight(newPositions[containing]), oldPeak)
+		if !ok || len(steps) != len(proof.Witness[index]) {
+			return false
+		}
+		accumulator := append([]byte(nil), proof.OldPeaks[index]...)
+		for stepIndex, step := range steps {
+			sibling := proof.Witness[index][stepIndex]
+			if len(sibling) != hashSize {
+				return false
+			}
+			if step.targetIsRight {
+				accumulator = interiorHash(sibling, accumulator, step.parent)
+			} else {
+				accumulator = interiorHash(accumulator, sibling, step.parent)
+			}
+		}
+		if !bytes.Equal(accumulator, proof.NewPeaks[containing]) {
+			return false
+		}
+	}
+	return true
+}
+
+// RootFromPeaks bags an ordered tallest-to-smallest accumulator into the
+// scalar root used by the local CLL proof API.
+func RootFromPeaks(peaks [][]byte) []byte {
+	if len(peaks) == 0 {
+		return make([]byte, hashSize)
+	}
+	return dtmmr.HashPeaksRHS(sha256.New(), cloneProof(peaks))
+}
+
+type pathStep struct {
+	sibling       uint64
+	targetIsRight bool
+	parent        uint64
+}
+
+func containingPeak(position uint64, peaks []uint64) int {
+	for index, peak := range peaks {
+		height := dtmmr.IndexHeight(peak)
+		mountainSize := (uint64(1) << (height + 1)) - 1
+		start := peak - mountainSize + 1
+		if position >= start && position <= peak {
+			return index
+		}
+	}
+	return -1
+}
+
+func pathToPeak(root, height, target uint64) ([]pathStep, bool) {
+	steps := make([]pathStep, 0, height)
+	currentRoot := root
+	currentHeight := height
+	for currentHeight > 0 && currentRoot != target {
+		leftSize := (uint64(1) << currentHeight) - 1
+		leftRoot := currentRoot - leftSize - 1
+		rightRoot := currentRoot - 1
+		if target <= leftRoot {
+			steps = append(steps, pathStep{sibling: rightRoot, parent: currentRoot})
+			currentRoot = leftRoot
+		} else {
+			steps = append(steps, pathStep{sibling: leftRoot, targetIsRight: true, parent: currentRoot})
+			currentRoot = rightRoot
+		}
+		currentHeight--
+	}
+	if currentRoot != target {
+		return nil, false
+	}
+	for left, right := 0, len(steps)-1; left < right; left, right = left+1, right-1 {
+		steps[left], steps[right] = steps[right], steps[left]
+	}
+	return steps, true
+}
+
+func interiorHash(left, right []byte, position uint64) []byte {
+	hasher := sha256.New()
+	var encoded [8]byte
+	binary.BigEndian.PutUint64(encoded[:], position+1)
+	hasher.Write(encoded[:])
+	hasher.Write(left)
+	hasher.Write(right)
+	return hasher.Sum(nil)
+}
+
+func cloneWitness(input [][][]byte) [][][]byte {
+	output := make([][][]byte, len(input))
+	for index := range input {
+		output[index] = cloneProof(input[index])
+	}
+	return output
 }
 
 // VerifyInclusion validates a Capsule ID leaf against a bagged MMR root.

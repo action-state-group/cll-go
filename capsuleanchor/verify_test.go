@@ -1,6 +1,7 @@
 package capsuleanchor
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
@@ -20,12 +21,13 @@ func TestReceiptVerifierBindsStatementProofAndPinnedKey(t *testing.T) {
 	require.NoError(t, err)
 	statementSigner, err := checkpoint.NewEd25519Signer(statementPrivate)
 	require.NoError(t, err)
+	checkpointRoot := bytes.Repeat([]byte{0x01}, 32)
 	payload, err := (checkpoint.Payload{
 		LogID: "verification-log", KeyID: statementSigner.KeyID(), MMRSize: 1,
-		Root: fmt.Sprintf("%064x", 1), Timestamp: time.Date(2026, 8, 27, 0, 0, 0, 0, time.UTC),
+		Root: fmt.Sprintf("%x", checkpointRoot), Timestamp: time.Date(2026, 8, 27, 0, 0, 0, 0, time.UTC),
 	}).CanonicalJSON()
 	require.NoError(t, err)
-	statement, err := statementSigner.SignCheckpoint(t.Context(), payload)
+	statement, err := statementSigner.SignCheckpoint(t.Context(), payload, [][]byte{checkpointRoot}, nil, nil)
 	require.NoError(t, err)
 	record, err := checkpoint.ParseRecord(statement)
 	require.NoError(t, err)
@@ -45,13 +47,8 @@ func TestReceiptVerifierBindsStatementProofAndPinnedKey(t *testing.T) {
 	receipt.EntryHashScheme = "unknown"
 	require.Error(t, verifier.Verify(statement, receipt))
 
-	if record.Signature[0] == '0' {
-		record.Signature = "1" + record.Signature[1:]
-	} else {
-		record.Signature = "0" + record.Signature[1:]
-	}
-	tampered, err := record.CanonicalJSON()
-	require.NoError(t, err)
+	tampered := append([]byte(nil), statement...)
+	tampered[len(tampered)-1] ^= 1
 	receipt.EntryHashScheme = EntryHashSchemeCheckpointDigest
 	require.Error(t, verifier.Verify(tampered, receipt))
 }

@@ -25,16 +25,16 @@ Action State Group.
 ## Source baseline
 
 The initial design was checked against these `origin/main` commits on
-2026-08-25. The checkpoint and witness rows were refreshed on 2026-08-27 for
-the checkpoint-only migration:
+2026-08-25. The checkpoint and witness rows were refreshed on 2026-08-28 for
+the canonical COSE checkpoint migration:
 
 | Repository | Commit | Use |
 |---|---|---|
 | `action-state-group/agent-action-capsule` | `7dcef86634355c0d3335b3050b1bc18845716275` | AAC format-4 verifier, JCS Capsule ID, Producer Envelope verifier, vectors |
 | `ethanyzhang/capsule-producer-go` | `cb9de82a792c387e64f39f719221511b3fa27b49` | producer/ledger boundary and Go version |
-| `action-state-group/capsule-emit` | `ab5434798565ed2058a7faa86a86fb1cf6097521` | direct CheckpointRecord signing body, digest, Ed25519 signature, and offline verification |
+| `action-state-group/capsule-emit` | `aa9f2fd00e8b1343a8f86a05479051a184155496` | canonical CLL checkpoint COSE profile and interoperability vectors |
 | `action-state-group/capsule-ledger` | `01f2ae6c4e7d54793ed308a624c367e702a8d089` | sequence, chain-gap, and checkpoint persistence behavior |
-| `action-state-group/capsule-anchor` | `e635ba88e4337bb8b3bffa3582aeb542f140bb90` | checkpoint-only `/v1/checkpoint` request, signature gate, response, and receipt contract |
+| `action-state-group/capsule-anchor` | `26083a7bd7720267cdd4e3711e8d76689ea989be` | canonical `/checkpoints` COSE request, signature gate, response, and receipt contract |
 | `datatrails/go-datatrails-merklelog` | `275103a34a08e56a376107246e04dc5819cc44cc` | MMRIVER-compatible Go reference and KATs |
 | `action-state-group/scitt-cose` | `36ec13992287a463481d1b00ac2098f032f229b5` | independent Go COSE/receipt verifier and conformance vectors |
 
@@ -73,6 +73,7 @@ type Record struct {
     Seq          uint64
     CapsuleID    CapsuleID
     Capsule      []byte
+    Authenticity Authenticity
     Envelopes    []Envelope
     Verification VerificationResult
     ParentID     CapsuleID
@@ -86,22 +87,24 @@ type Envelope struct {
     AddedAt      time.Time
 }
 
-type Ledger interface {
-    Append(ctx context.Context, capsule []byte, envelopes ...[]byte) (Record, error)
-    AddEnvelope(ctx context.Context, id CapsuleID, envelope []byte) (Envelope, error)
-    Get(ctx context.Context, id CapsuleID) (Record, error)
-    Scan(ctx context.Context, after uint64, limit int) ([]Record, error)
-    FindChainGaps(ctx context.Context) ([]ChainGap, error)
-}
+type Service struct { /* private dependencies */ }
 
-type Auditor interface {
-    Audit(ctx context.Context, maxRecords int) ([]RecordVerification, error)
-}
+func (s *Service) Append(ctx context.Context, mode AdmissionMode, capsule []byte, envelopes ...[]byte) (Record, error)
+func (s *Service) AddEnvelope(ctx context.Context, id CapsuleID, envelope []byte) (Envelope, error)
+func (s *Service) Get(ctx context.Context, id CapsuleID) (Record, error)
+func (s *Service) Scan(ctx context.Context, after uint64, limit int) ([]Record, error)
+func (s *Service) FindChainGaps(ctx context.Context) ([]ChainGap, error)
+func (s *Service) Audit(ctx context.Context, maxRecords int) ([]RecordVerification, error)
 ```
 
 Returned byte slices are defensive copies. `Append` verifies the Capsule and
-all provided envelopes before the durable write. Duplicate input returns the
-stored record after exact-byte comparison of the Capsule and every supplied
+every provided envelope before the durable write. `AdmissionSigned` requires
+at least one envelope and rejects the entire append if any supplied envelope
+does not verify against the recomputed Capsule ID. `AdmissionUnsigned` rejects
+envelopes. Envelope presence never selects or changes the admission mode.
+`ErrAdmission` wraps `ErrInvalid`, so hosts can classify it as bad caller input
+while retaining the narrower admission-rejection signal. Duplicate input
+returns the stored record after exact-byte comparison of the Capsule and every supplied
 Envelope. Envelopes added after the original append may be present in that
 stored result and do not make an older append retry conflict. `Get` requires an
 exact ID; prefix lookup is deliberately absent from the integrity API.
@@ -175,7 +178,7 @@ whose first sequence is not `afterSeq+1` or whose entries are not contiguous.
 ```go
 type Signer interface {
     KeyID() string
-    SignCheckpoint(ctx context.Context, payload []byte) ([]byte, error)
+    SignCheckpoint(ctx context.Context, payload []byte, newPeaks, prevPeaks [][]byte, proof *mmr.ConsistencyProof) ([]byte, error)
     VerifyCheckpoint(payload, statement []byte) error
 }
 
@@ -190,16 +193,21 @@ type Verifier interface {
 }
 ```
 
-The wire signer emits the direct JSON `CheckpointRecord` shared with
-`capsule-emit`. `key_id` is the lowercase hex encoding of the raw Ed25519
-public key. `signature` is Ed25519 over the lowercase hexadecimal SHA-256
-digest of the canonical signature-free body, encoded as ASCII. Private key
-loading and authorization remain outside the library; a helper accepts an
-already-held Ed25519 key and derives `key_id`. The helper verifies its own
-output before the checkpoint is committed. On restart, the runner also
-verifies every stored checkpoint signature, canonical payload, predecessor,
-historical MMR root, and cursor-to-leaf-count relationship before extending
-the log.
+The wire signer emits the canonical raw COSE_Sign1 checkpoint profile shared
+with `capsule-emit` and consumed by `capsule-anchor`. Its protected headers bind
+EdDSA, `application/cll-checkpoint+cbor`, the raw Ed25519 public key as `kid`,
+and CWT issuer/subject claims for the log and MMR size. Its canonical CBOR
+payload binds the current and previous MMR peak commitments plus issue time.
+Every non-first checkpoint also carries the profile's `consistency_proof`
+claim, including old peaks, per-old-peak witness paths, and new peaks. The
+parser accepts and authenticates the optional `cadence` claim and verifies the
+consistency proof before exposing a non-first checkpoint.
+Private key loading and authorization remain outside the library; a helper
+accepts an already-held Ed25519 key and derives the diagnostic JSON `key_id`.
+The helper verifies its own output before the checkpoint is committed. On
+restart, the runner also verifies every stored checkpoint signature, canonical
+payload, predecessor, historical MMR root, and cursor-to-leaf-count
+relationship before extending the log.
 
 ## AAC format-4 verification
 
@@ -274,7 +282,8 @@ a sequence gap.
 
 ## Checkpoints and runner
 
-The witness-facing payload is the direct canonical JSON `CheckpointRecord`:
+The ledger persists this canonical JSON developer projection for local
+inspection and deterministic digesting:
 
 ```json
 {
@@ -285,19 +294,19 @@ The witness-facing payload is the direct canonical JSON `CheckpointRecord`:
   "prev_root": "<64 lowercase hex or empty for first>",
   "prev_size": 100,
   "root": "<64 lowercase hex>",
-  "signature": "<Ed25519 signature as lowercase hex>",
   "timestamp": "2026-08-25T00:00:00Z",
   "v": 1
 }
 ```
 
-The signature-free projection is persisted as exact canonical payload bytes.
-The complete signed record is persisted separately and matches
-`capsule_emit.checkpoint.emit.CheckpointRecord` byte for byte for the same
-inputs. The signing digest is SHA-256 of the signature-free canonical JSON;
-the signature covers that digest's lowercase hex encoded as ASCII.
+The witness-facing statement is not JSON. It is the raw canonical COSE_Sign1
+described above. The signed CBOR payload contains `kind`, `log_size`, canonical
+CBOR-encoded current and previous peak commitments, and `issued_at`. The
+complete COSE statement is persisted separately. Its protected `kid` maps to
+the projection's `key_id`; bagging its peak commitments maps to `root` and
+`prev_root`.
 
-The local record stores exact payload bytes, exact signed-record JSON, creation
+The local record stores exact payload bytes, exact signed COSE bytes, creation
 time, and witness states. Before signing, the runner recomputes the
 previous root, requires the same log, requires increasing MMR size, and binds
 `prev_size` and local `prev_root` to the prior checkpoint.
@@ -351,9 +360,9 @@ record is not write-only evidence.
 The default client calls:
 
 ```text
-POST {baseURL}/v1/checkpoint
-Content-Type: application/json
-<direct CheckpointRecord JSON>
+POST {baseURL}/checkpoints
+Content-Type: application/cll-checkpoint+cbor
+<raw canonical COSE_Sign1 checkpoint statement>
 ```
 
 The client accepts one bounded 2xx response profile containing
@@ -429,9 +438,10 @@ MMR node writes are insert-only. A position collision inside a mutation is a
 conflict. The cursor compare-and-swap prevents blind replay of stale CLL
 mutations; callers reload state and recompute after contention. Deadlock and
 lock-timeout failures are retryable. Every row loop checks `rows.Err()`.
-The checkpoint-record migration initializes schema version 2 from empty
-storage and rejects other versions. Version 1 is intentionally unsupported;
-this migration does not retain the old signed-statement storage contract.
+The admission-state and COSE checkpoint migration initializes schema version 3
+from empty storage and rejects other versions. Versions 1 and 2 are
+intentionally unsupported; this migration does not retain either earlier
+storage contract.
 `Close` is idempotent for all stores.
 
 ## SQLite storage
@@ -445,8 +455,8 @@ in write transactions that acquire the writer reservation before reading the
 next sequence or CLL cursor. Two-handle tests exercise concurrent allocation.
 SQLite, JSONL, and MySQL run the same data-path contract suite; backend-specific
 tests cover locking, restart, and corruption behavior. SQLite also initializes
-schema version 2 and rejects an unknown version; version 1 is intentionally not
-migrated.
+schema version 3 and rejects unknown or earlier versions; versions 1 and 2 are
+intentionally not migrated.
 
 ## Failure and recovery
 
@@ -483,7 +493,7 @@ store/jsonl/        JSONL journal backend
 store/sqlite/       embedded SQLite backend
 store/mysql/        MySQL backend
 mmr/                CLL hashing, proofs, DataTrails adapter
-checkpoint/         payload, direct JSON signer, cadence, runner
+checkpoint/         payload, canonical COSE signer, cadence, runner
 capsuleanchor/      checkpoint-only witness client and receipt verifier
 internal/storetest/ shared three-backend contract suites
 ledger/testdata/    attributed AAC registry and Capsule vectors

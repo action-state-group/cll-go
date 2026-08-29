@@ -21,7 +21,7 @@ import (
 const (
 	journalName          = "ledger.jsonl"
 	maxJournalEventBytes = 4 << 20
-	schemaVersion        = 2
+	schemaVersion        = 3
 )
 
 type event struct {
@@ -158,6 +158,9 @@ func (s *Store) apply(entry event) error {
 		}
 		if entry.Record == nil || entry.Record.Seq != uint64(len(s.order)+1) {
 			return fmt.Errorf("non-contiguous capsule append")
+		}
+		if err := entry.Record.Validate(); err != nil {
+			return fmt.Errorf("invalid capsule record: %w", err)
 		}
 		if _, exists := s.records[entry.Record.CapsuleID]; exists {
 			return fmt.Errorf("duplicate capsule id")
@@ -556,14 +559,14 @@ func (s *Store) Append(ctx context.Context, input ledger.AppendInput) (ledger.Re
 		return ledger.Record{}, "", ledger.ErrClosed
 	}
 	if existing, ok := s.records[input.CapsuleID]; ok {
-		if !bytes.Equal(existing.Capsule, input.Capsule) || !sameEnvelopes(existing.Envelopes, input.Envelopes) {
+		if existing.Authenticity != input.Authenticity || !bytes.Equal(existing.Capsule, input.Capsule) || !sameEnvelopes(existing.Envelopes, input.Envelopes) {
 			return ledger.Record{}, "", ledger.ErrConflict
 		}
 		return cloneRecord(existing), ledger.AppendIdempotent, nil
 	}
 	record := ledger.Record{
 		Seq: uint64(len(s.order) + 1), CapsuleID: input.CapsuleID,
-		Capsule: clone(input.Capsule), Envelopes: cloneEnvelopes(input.Envelopes),
+		Capsule: clone(input.Capsule), Authenticity: input.Authenticity, Envelopes: cloneEnvelopes(input.Envelopes),
 		Verification: input.Verification, ParentID: input.ParentID, AppendedAt: ledger.NormalizeTime(input.AppendedAt),
 	}
 	entry := event{Version: schemaVersion, Type: "capsule.append", Record: &record}

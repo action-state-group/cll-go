@@ -15,7 +15,7 @@ import (
 // Signer signs canonical checkpoint payloads.
 type Signer interface {
 	KeyID() string
-	SignCheckpoint(context.Context, []byte) ([]byte, error)
+	SignCheckpoint(context.Context, []byte, [][]byte, [][]byte, *mmr.ConsistencyProof) ([]byte, error)
 	VerifyCheckpoint([]byte, []byte) error
 }
 
@@ -173,7 +173,24 @@ func (r *Runner) RunOnce(ctx context.Context, now time.Time) (bool, error) {
 		if err != nil {
 			return false, err
 		}
-		statement, err := r.signer.SignCheckpoint(ctx, body)
+		newPeaks, err := tree.PeakHashesAt(tree.Size())
+		if err != nil {
+			return false, err
+		}
+		var prevPeaks [][]byte
+		var proof *mmr.ConsistencyProof
+		if previous != nil {
+			prevPeaks, err = tree.PeakHashesAt(previous.MMRSize)
+			if err != nil {
+				return false, err
+			}
+			consistency, err := tree.ConsistencyProof(previous.MMRSize)
+			if err != nil {
+				return false, err
+			}
+			proof = &consistency
+		}
+		statement, err := r.signer.SignCheckpoint(ctx, body, newPeaks, prevPeaks, proof)
 		if err != nil {
 			return false, err
 		}
