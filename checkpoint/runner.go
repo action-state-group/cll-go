@@ -200,7 +200,10 @@ func (r *Runner) RunOnce(ctx context.Context, now time.Time) (bool, error) {
 	if len(entries) == 0 && cp == nil {
 		return false, nil
 	}
-	mutation := ledger.CLLMutation{ExpectedIndexedSeq: state.IndexedSeq, IndexedSeq: indexed, Nodes: newNodes, FirstUncheckpointed: firstUncheckpointed, Checkpoint: cp, WitnessIDs: r.config.WitnessIDs}
+	mutation := ledger.CLLMutation{ExpectedIndexedSeq: state.IndexedSeq, IndexedSeq: indexed, Nodes: newNodes, FirstUncheckpointed: firstUncheckpointed, Checkpoint: cp}
+	if cp != nil {
+		mutation.WitnessIDs = r.config.WitnessIDs
+	}
 	if err := r.store.CommitCLL(ctx, mutation); err != nil {
 		return false, err
 	}

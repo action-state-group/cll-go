@@ -73,6 +73,7 @@ func TestRunnerPersistsAndEnforcesAgeCadenceWithoutNewEntry(t *testing.T) {
 	started := time.Date(2026, 8, 25, 5, 0, 0, 0, time.UTC)
 	appendCapsules(t, store, started, 1)
 	config := checkpoint.DefaultRunnerConfig("age-log")
+	config.WitnessIDs = []string{"anchor"}
 	runner, err := checkpoint.NewRunner(config, store, signer)
 	require.NoError(t, err)
 	changed, err := runner.RunOnce(t.Context(), started)
@@ -82,6 +83,9 @@ func TestRunnerPersistsAndEnforcesAgeCadenceWithoutNewEntry(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, state.Checkpoints)
 	require.Equal(t, started, state.FirstUncheckpointed)
+	pending, err := store.PendingWitnesses(t.Context(), "anchor", 10)
+	require.NoError(t, err)
+	require.Empty(t, pending)
 
 	changed, err = runner.RunOnce(t.Context(), started.Add(15*time.Minute))
 	require.NoError(t, err)
@@ -90,6 +94,9 @@ func TestRunnerPersistsAndEnforcesAgeCadenceWithoutNewEntry(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, state.Checkpoints, 1)
 	require.True(t, state.FirstUncheckpointed.IsZero())
+	pending, err = store.PendingWitnesses(t.Context(), "anchor", 10)
+	require.NoError(t, err)
+	require.Len(t, pending, 1)
 }
 
 func TestRunnerRejectsTamperedPersistedCheckpoint(t *testing.T) {
