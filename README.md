@@ -24,7 +24,7 @@ verified ledger associations and do not create CLL leaves.
 The end-to-end integration uses both the producer and ledger modules:
 
 ```sh
-go get github.com/ethanyzhang/capsule-producer-go@latest
+go get github.com/ethanyzhang/capsule-emit-go@latest
 go get github.com/ethanyzhang/capsule-ledger-go@latest
 ```
 
@@ -63,7 +63,7 @@ import (
     "fmt"
     "time"
 
-    producer "github.com/ethanyzhang/capsule-producer-go"
+    "github.com/ethanyzhang/capsule-emit-go"
 
     "github.com/ethanyzhang/capsule-ledger-go/capsuleanchor"
     "github.com/ethanyzhang/capsule-ledger-go/checkpoint"
@@ -105,20 +105,20 @@ func PublishInvestigation(
     }
 
     // Build a signature-free Capsule and one independent Producer Envelope.
-    producerIdentity, err := producer.NewEd25519SigningIdentity(producerPrivateKey)
+    producerIdentity, err := emit.NewEd25519SigningIdentity(producerPrivateKey)
     if err != nil {
         return err
     }
-    produced, err := producer.Seal(producer.Input{
+    produced, err := emit.Seal(emit.Input{
         ActionID:   "investigation-123",
-        ActionType: producer.ActionTypeDecide,
+        ActionType: emit.ActionTypeDecide,
         Operator:   "alchemy",
         Developer:  "alchemy@1.0.0",
         Timestamp:  time.Now().UTC(),
-        Disposition: &producer.Disposition{
-            Decision:      producer.DecisionAccept,
-            Approver:      producer.ApproverPolicy,
-            VerdictClass:  producer.VerdictExecuted,
+        Disposition: &emit.Disposition{
+            Decision:      emit.DecisionAccept,
+            Approver:      emit.ApproverPolicy,
+            VerdictClass:  emit.VerdictExecuted,
             HumanDisposed: false,
         },
     }, producerIdentity)
@@ -207,7 +207,7 @@ func PublishInvestigation(
 The call path is:
 
 ```text
-producer.Seal
+emit.Seal
     -> Capsule + Producer Envelope
 ledger.Service.Append
     -> durable Capsule record with seq

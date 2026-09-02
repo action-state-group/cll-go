@@ -14,8 +14,8 @@ import (
 
 	"github.com/action-state-group/agent-action-capsule/go/canonical"
 	aacverify "github.com/action-state-group/agent-action-capsule/go/verify"
+	"github.com/ethanyzhang/capsule-emit-go"
 	"github.com/ethanyzhang/capsule-ledger-go/ledger"
-	producer "github.com/ethanyzhang/capsule-producer-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -357,11 +357,11 @@ func producerEnvelope(t *testing.T, capsule []byte) []byte {
 	t.Helper()
 	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
 	require.NoError(t, err)
-	identity, err := producer.NewEd25519SigningIdentity(privateKey)
+	identity, err := emit.NewEd25519SigningIdentity(privateKey)
 	require.NoError(t, err)
 	_, capsuleID, err := (ledger.AACVerifier{}).VerifyCapsule(capsule)
 	require.NoError(t, err)
-	envelope, err := producer.Sign(producer.BuiltPayload{CapsuleID: string(capsuleID), JSON: capsule}, identity)
+	envelope, err := emit.Sign(emit.BuiltPayload{CapsuleID: string(capsuleID), JSON: capsule}, identity)
 	require.NoError(t, err)
 	return envelope
 }

@@ -26,7 +26,7 @@ Peer checkouts normally live beside this repository under `~/GitHub`.
 Design and implementation reviews must compare:
 
 - `agent-action-capsule` AAC format 4 and its Go/Python vectors;
-- `capsule-producer-go` Capsule and Producer Envelope behavior;
+- `capsule-emit-go` Capsule and Producer Envelope behavior;
 - `capsule-emit/checkpoint` CLL/MMR and checkpoint behavior;
 - `capsule-ledger` ledger semantics and current gaps;
 - `capsule-anchor` request, receipt, and witness behavior;

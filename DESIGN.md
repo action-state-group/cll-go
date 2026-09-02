@@ -12,7 +12,7 @@ to external witnesses.
 
 Alchemy owns its investigation workflow, GitHub publication, application
 profile, MySQL outbox, retries, and signer authorization.
-`capsule-producer-go` constructs Capsules and Producer Envelopes. This library
+`capsule-emit-go` constructs Capsules and Producer Envelopes. This library
 verifies and stores their output. `capsule-anchor` is an external Transparency
 Service. It receives signed checkpoint records; it does not pull records or
 read Alchemy's outbox.
@@ -32,7 +32,7 @@ refreshed on 2026-09-01 for stored-Capsule interoperability:
 | Repository | Commit | Use |
 |---|---|---|
 | `action-state-group/agent-action-capsule` | `7e112c8b877ad79d4d2a53be7b522a63470a2b1d` | AAC 0.2.0 format-4 verifier, plain-JCS Capsule ID with local-only envelope-field exclusion, Producer Envelope verifier, vectors |
-| `ethanyzhang/capsule-producer-go` | `46cb5199debe4c7a506d1ba050461efa03a2e914` | producer/ledger boundary, Go version, and stored-Capsule verifier interoperability |
+| `ethanyzhang/capsule-emit-go` | `8cb58fc2d2679ce5c72ffaaa305239c67a2d7fe6` | emission/ledger boundary, Go version, and stored-Capsule verifier interoperability |
 | `action-state-group/capsule-emit` | `aa9f2fd00e8b1343a8f86a05479051a184155496` | 0.5.1 Capsule shape, canonical CLL checkpoint COSE profile, and interoperability vectors |
 | `action-state-group/capsule-ledger` | `f3c37376d61f97327c1fc6a6ce519c9357317177` | explicit unsigned/signed admission, authenticity persistence, sequence, chain-gap, and checkpoint behavior |
 | `action-state-group/capsule-anchor` | `26083a7bd7720267cdd4e3711e8d76689ea989be` | canonical `/checkpoints` COSE request, signature gate, response, and receipt contract |

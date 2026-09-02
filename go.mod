@@ -5,7 +5,7 @@ go 1.27.0
 require (
 	github.com/action-state-group/agent-action-capsule/go v0.0.0-20260829034405-7e112c8b877a
 	github.com/datatrails/go-datatrails-merklelog/mmr v0.4.2-0.20250428132117-275103a34a08
-	github.com/ethanyzhang/capsule-producer-go v0.0.0-20260901231613-46cb5199debe
+	github.com/ethanyzhang/capsule-emit-go v0.0.0-20260902000221-8cb58fc2d267
 	github.com/fxamacker/cbor/v2 v2.9.0
 	github.com/go-sql-driver/mysql v1.10.0
 	github.com/stretchr/testify v1.12.1
