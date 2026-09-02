@@ -8,8 +8,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ethanyzhang/capsule-ledger-go/ledger"
-	"github.com/ethanyzhang/capsule-ledger-go/mmr"
+	"github.com/ethanyzhang/cll-go/cll"
+	"github.com/ethanyzhang/cll-go/ledger"
+	"github.com/ethanyzhang/cll-go/mmr"
 )
 
 // Signer signs canonical checkpoint payloads.
@@ -37,13 +38,20 @@ func DefaultRunnerConfig(logID string) RunnerConfig {
 type Runner struct {
 	mu     sync.Mutex
 	config RunnerConfig
-	store  ledger.CheckpointStore
+	store  Store
 	signer Signer
 	notify chan struct{}
 }
 
+// Store is the application-neutral entry source plus durable checkpoint state
+// needed by Runner. AAC ledger stores are one implementation.
+type Store interface {
+	cll.Source
+	ledger.CLLStore
+}
+
 // NewRunner validates dependencies without starting background work.
-func NewRunner(config RunnerConfig, store ledger.CheckpointStore, signer Signer) (*Runner, error) {
+func NewRunner(config RunnerConfig, store Store, signer Signer) (*Runner, error) {
 	if ledger.ValidateIdentifier(config.LogID) != nil || store == nil || signer == nil || config.ScanLimit <= 0 || config.ScanLimit > ledger.MaxScanLimit || config.PollInterval <= 0 {
 		return nil, fmt.Errorf("%w: invalid runner configuration", ledger.ErrInvalid)
 	}
@@ -127,7 +135,7 @@ func (r *Runner) RunOnce(ctx context.Context, now time.Time) (bool, error) {
 	if err := r.verifyCheckpoints(state, nodes); err != nil {
 		return false, err
 	}
-	entries, err := r.store.ScanIDs(ctx, state.IndexedSeq, r.config.ScanLimit)
+	entries, err := r.store.ScanEntries(ctx, state.IndexedSeq, r.config.ScanLimit)
 	if err != nil {
 		return false, err
 	}
@@ -139,9 +147,12 @@ func (r *Runner) RunOnce(ctx context.Context, now time.Time) (bool, error) {
 	indexed := state.IndexedSeq
 	for _, entry := range entries {
 		if entry.Seq != indexed+1 {
-			return false, fmt.Errorf("%w: non-contiguous ledger projection", ledger.ErrCorrupt)
+			return false, fmt.Errorf("%w: non-contiguous CLL projection", ledger.ErrCorrupt)
 		}
-		if _, err := tree.AppendCapsuleID(string(entry.CapsuleID)); err != nil {
+		if entry.AppendedAt.IsZero() {
+			return false, fmt.Errorf("%w: CLL entry append time is zero", ledger.ErrCorrupt)
+		}
+		if _, err := tree.Append(entry.Value); err != nil {
 			return false, err
 		}
 		indexed = entry.Seq

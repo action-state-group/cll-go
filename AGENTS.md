@@ -2,11 +2,11 @@
 
 ## Project purpose
 
-`capsule-ledger-go` implements an AAC format-4 ledger, independent Producer
-Envelope persistence, a storage-neutral CLL/MMR, checkpointing, and external
-witness integration.
+`cll-go` implements storage-neutral CLL entry, MMR, checkpoint, and
+external-witness primitives, plus an AAC format-4 ledger binding with
+independent Producer Envelope persistence.
 
-Go module: `github.com/ethanyzhang/capsule-ledger-go`.
+Go module: `github.com/ethanyzhang/cll-go`.
 
 ## Source grounding
 

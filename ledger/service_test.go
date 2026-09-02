@@ -7,8 +7,8 @@ import (
 	"time"
 
 	"github.com/action-state-group/agent-action-capsule/go/canonical"
-	"github.com/ethanyzhang/capsule-ledger-go/ledger"
-	"github.com/ethanyzhang/capsule-ledger-go/store/jsonl"
+	"github.com/ethanyzhang/cll-go/ledger"
+	"github.com/ethanyzhang/cll-go/store/jsonl"
 	"github.com/stretchr/testify/require"
 )
 

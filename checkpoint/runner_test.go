@@ -1,6 +1,7 @@
 package checkpoint_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -9,11 +10,76 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ethanyzhang/capsule-ledger-go/checkpoint"
-	"github.com/ethanyzhang/capsule-ledger-go/ledger"
-	"github.com/ethanyzhang/capsule-ledger-go/store/jsonl"
+	"github.com/ethanyzhang/cll-go/checkpoint"
+	"github.com/ethanyzhang/cll-go/cll"
+	"github.com/ethanyzhang/cll-go/ledger"
+	"github.com/ethanyzhang/cll-go/store/jsonl"
 	"github.com/stretchr/testify/require"
 )
+
+type genericRunnerStore struct {
+	ledger.CLLStore
+	entries []cll.Entry
+}
+
+func (s genericRunnerStore) ScanEntries(ctx context.Context, afterSeq uint64, limit int) ([]cll.Entry, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if limit <= 0 || afterSeq >= uint64(len(s.entries)) {
+		return nil, nil
+	}
+	end := int(afterSeq) + limit
+	if end > len(s.entries) {
+		end = len(s.entries)
+	}
+	result := make([]cll.Entry, 0, end-int(afterSeq))
+	for _, entry := range s.entries[afterSeq:end] {
+		result = append(result, entry.Clone())
+	}
+	return result, nil
+}
+
+func TestRunnerIndexesGenericCLLSource(t *testing.T) {
+	stateStore, signer := runnerFixture(t, "generic-log")
+	started := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
+	store := genericRunnerStore{
+		CLLStore: stateStore,
+		entries: []cll.Entry{{
+			Seq:        1,
+			Value:      bytes.Repeat([]byte{0x42}, 32),
+			AppendedAt: started,
+		}},
+	}
+	config := checkpoint.DefaultRunnerConfig("generic-log")
+	config.Cadence.CadenceEntries = 1
+	runner, err := checkpoint.NewRunner(config, store, signer)
+	require.NoError(t, err)
+
+	changed, err := runner.RunOnce(t.Context(), started)
+	require.NoError(t, err)
+	require.True(t, changed)
+	state, err := stateStore.LoadCLL(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), state.IndexedSeq)
+	require.Len(t, state.Checkpoints, 1)
+}
+
+func TestRunnerRejectsGenericEntryWithoutAppendTime(t *testing.T) {
+	stateStore, signer := runnerFixture(t, "zero-time-log")
+	store := genericRunnerStore{
+		CLLStore: stateStore,
+		entries: []cll.Entry{{
+			Seq:   1,
+			Value: bytes.Repeat([]byte{0x42}, 32),
+		}},
+	}
+	runner, err := checkpoint.NewRunner(checkpoint.DefaultRunnerConfig("zero-time-log"), store, signer)
+	require.NoError(t, err)
+
+	_, err = runner.RunOnce(t.Context(), time.Now())
+	require.ErrorIs(t, err, ledger.ErrCorrupt)
+}
 
 func TestRunnerCreatesDurableCheckpointAtEntryCadence(t *testing.T) {
 	store, signer := runnerFixture(t, "entry-log")

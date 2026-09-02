@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ethanyzhang/capsule-ledger-go/mmr"
+	"github.com/ethanyzhang/cll-go/mmr"
 	"github.com/stretchr/testify/require"
 )
 

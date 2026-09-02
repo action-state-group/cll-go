@@ -10,7 +10,7 @@ import (
 	"encoding/hex"
 	"fmt"
 
-	"github.com/ethanyzhang/capsule-ledger-go/checkpoint"
+	"github.com/ethanyzhang/cll-go/checkpoint"
 	"github.com/fxamacker/cbor/v2"
 	"github.com/veraison/go-cose"
 )

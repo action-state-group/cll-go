@@ -15,7 +15,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ethanyzhang/capsule-ledger-go/checkpoint"
+	"github.com/ethanyzhang/cll-go/checkpoint"
 )
 
 // DefaultMaxResponseBytes bounds a witness response to one MiB.

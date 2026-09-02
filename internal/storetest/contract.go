@@ -15,7 +15,7 @@ import (
 	"github.com/action-state-group/agent-action-capsule/go/canonical"
 	aacverify "github.com/action-state-group/agent-action-capsule/go/verify"
 	"github.com/ethanyzhang/capsule-emit-go"
-	"github.com/ethanyzhang/capsule-ledger-go/ledger"
+	"github.com/ethanyzhang/cll-go/ledger"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -109,6 +109,13 @@ func Run(t *testing.T, open Factory) {
 		require.Len(t, entries, 1)
 		assert.Equal(t, uint64(2), entries[0].Seq)
 		assert.Equal(t, appendInput(2).CapsuleID, entries[0].CapsuleID)
+		cllEntries, err := store.ScanEntries(t.Context(), 1, 10)
+		require.NoError(t, err)
+		require.Len(t, cllEntries, 1)
+		expectedValue, err := hex.DecodeString(string(entries[0].CapsuleID))
+		require.NoError(t, err)
+		assert.Equal(t, expectedValue, cllEntries[0].Value)
+		assert.Equal(t, entries[0].Seq, cllEntries[0].Seq)
 		gaps, err := store.FindChainGaps(t.Context())
 		require.NoError(t, err)
 		require.Len(t, gaps, 1)
@@ -116,6 +123,8 @@ func Run(t *testing.T, open Factory) {
 		_, err = store.Scan(t.Context(), 0, 0)
 		assert.ErrorIs(t, err, ledger.ErrInvalid)
 		_, err = store.ScanIDs(t.Context(), 0, 0)
+		assert.ErrorIs(t, err, ledger.ErrInvalid)
+		_, err = store.ScanEntries(t.Context(), 0, 0)
 		assert.ErrorIs(t, err, ledger.ErrInvalid)
 	})
 

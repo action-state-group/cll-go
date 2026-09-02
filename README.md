@@ -1,13 +1,16 @@
-# capsule-ledger-go
+# cll-go
 
-`capsule-ledger-go` is an embeddable Go implementation of an Agent Action
-Capsule (AAC) format-4 ledger with a Checkpointed Local Log (CLL).
+`cll-go` is an embeddable Go implementation of a Checkpointed Local Log (CLL).
+It treats an Agent Action Capsule (AAC) format-4 ledger as one application
+binding rather than as the definition of the log.
 
 It provides:
 
-- signature-free Capsules and independent Producer Envelopes;
+- application-neutral ordered 32-byte record identities consumed by
+  checkpointing;
+- an AAC binding for signature-free Capsules and independent Producer Envelopes;
 - a storage-neutral ledger with JSONL, SQLite, and MySQL implementations;
-- a narrow `LogSource` projection for ordered CLL/MMR indexing;
+- a narrow application-neutral `cll.Source` projection for CLL/MMR indexing;
 - signed checkpoints with explicit external witness clients and offline receipt
   verification;
 - conformance with the current AAC v4, Python CLL, and capsule-anchor contracts;
@@ -16,8 +19,10 @@ It provides:
 - a bounded checkpoint-only witness REST client;
 - offline RFC 9162 receipt verification under a pinned authority key.
 
-The CLL commits ordered Capsule IDs. Producer Envelopes remain independently
-verified ledger associations and do not create CLL leaves.
+The generic CLL commits ordered 32-byte record identities. Fixed width preserves
+leaf/interior domain separation in the MMR. The included AAC binding projects
+each verified Capsule ID into one entry. Producer Envelopes remain
+independently verified ledger associations and do not create CLL leaves.
 
 ## Install
 
@@ -25,7 +30,7 @@ The end-to-end integration uses both the producer and ledger modules:
 
 ```sh
 go get github.com/ethanyzhang/capsule-emit-go@latest
-go get github.com/ethanyzhang/capsule-ledger-go@latest
+go get github.com/ethanyzhang/cll-go@latest
 ```
 
 ## Storage
@@ -65,10 +70,10 @@ import (
 
     "github.com/ethanyzhang/capsule-emit-go"
 
-    "github.com/ethanyzhang/capsule-ledger-go/capsuleanchor"
-    "github.com/ethanyzhang/capsule-ledger-go/checkpoint"
-    "github.com/ethanyzhang/capsule-ledger-go/ledger"
-    "github.com/ethanyzhang/capsule-ledger-go/store/sqlite"
+    "github.com/ethanyzhang/cll-go/capsuleanchor"
+    "github.com/ethanyzhang/cll-go/checkpoint"
+    "github.com/ethanyzhang/cll-go/ledger"
+    "github.com/ethanyzhang/cll-go/store/sqlite"
 )
 
 func PublishInvestigation(

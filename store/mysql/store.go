@@ -11,8 +11,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ethanyzhang/capsule-ledger-go/ledger"
-	"github.com/ethanyzhang/capsule-ledger-go/mmr"
+	"github.com/ethanyzhang/cll-go/cll"
+	"github.com/ethanyzhang/cll-go/ledger"
+	"github.com/ethanyzhang/cll-go/mmr"
 	mysqlDriver "github.com/go-sql-driver/mysql"
 )
 
@@ -373,6 +374,15 @@ func (s *Store) ScanIDs(ctx context.Context, after uint64, limit int) ([]ledger.
 		entries = append(entries, entry)
 	}
 	return entries, rows.Err()
+}
+
+// ScanEntries projects AAC Capsule IDs into application-neutral CLL leaf bytes.
+func (s *Store) ScanEntries(ctx context.Context, after uint64, limit int) ([]cll.Entry, error) {
+	entries, err := s.ScanIDs(ctx, after, limit)
+	if err != nil {
+		return nil, err
+	}
+	return ledger.ProjectCLLEntries(entries)
 }
 
 func (s *Store) FindChainGaps(ctx context.Context) ([]ledger.ChainGap, error) {

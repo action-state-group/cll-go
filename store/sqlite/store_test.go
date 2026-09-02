@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ethanyzhang/capsule-ledger-go/internal/storetest"
-	"github.com/ethanyzhang/capsule-ledger-go/ledger"
+	"github.com/ethanyzhang/cll-go/internal/storetest"
+	"github.com/ethanyzhang/cll-go/ledger"
 	"github.com/stretchr/testify/require"
 )
 

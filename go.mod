@@ -1,4 +1,4 @@
-module github.com/ethanyzhang/capsule-ledger-go
+module github.com/ethanyzhang/cll-go
 
 go 1.27.0
 

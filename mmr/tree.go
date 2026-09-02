@@ -62,7 +62,16 @@ func (t *Tree) AppendCapsuleID(capsuleID string) (uint64, error) {
 	if err != nil || len(id) != hashSize || hex.EncodeToString(id) != capsuleID {
 		return 0, fmt.Errorf("capsule id must be 64 lowercase hexadecimal characters")
 	}
-	leafInput := append([]byte{0}, id...)
+	return t.Append(id)
+}
+
+// Append commits an application-neutral 32-byte record identity as the next
+// CLL leaf. Fixed-width identities preserve leaf/interior domain separation.
+func (t *Tree) Append(value []byte) (uint64, error) {
+	if len(value) != hashSize {
+		return 0, fmt.Errorf("CLL leaf value must be exactly 32 bytes")
+	}
+	leafInput := append([]byte{0}, value...)
 	leaf := sha256.Sum256(leafInput)
 
 	t.mu.Lock()
@@ -288,13 +297,19 @@ func cloneWitness(input [][][]byte) [][][]byte {
 	return output
 }
 
-// VerifyInclusion validates a Capsule ID leaf against a bagged MMR root.
+// VerifyInclusion validates an AAC Capsule ID leaf against a bagged MMR root.
 func VerifyInclusion(root []byte, mmrSize, leafIndex uint64, capsuleID string, proof [][]byte) bool {
-	if len(root) != hashSize || !validMMRSize(mmrSize) || leafIndex >= dtmmr.LeafCount(mmrSize) {
-		return false
-	}
 	id, err := hex.DecodeString(capsuleID)
 	if err != nil || len(id) != hashSize || hex.EncodeToString(id) != capsuleID {
+		return false
+	}
+	return VerifyInclusionValue(root, mmrSize, leafIndex, id, proof)
+}
+
+// VerifyInclusionValue validates a generic 32-byte CLL record identity against
+// a bagged MMR root.
+func VerifyInclusionValue(root []byte, mmrSize, leafIndex uint64, value []byte, proof [][]byte) bool {
+	if len(root) != hashSize || !validMMRSize(mmrSize) || leafIndex >= dtmmr.LeafCount(mmrSize) || len(value) != hashSize {
 		return false
 	}
 	for _, node := range proof {
@@ -302,9 +317,14 @@ func VerifyInclusion(root []byte, mmrSize, leafIndex uint64, capsuleID string, p
 			return false
 		}
 	}
-	leaf := sha256.Sum256(append([]byte{0}, id...))
+	leaf := sha256.Sum256(append([]byte{0}, value...))
 	return dtmmr.VerifyInclusionBagged(
-		mmrSize, sha256.New(), leaf[:], dtmmr.MMRIndex(leafIndex), proof, root,
+		mmrSize,
+		sha256.New(),
+		leaf[:],
+		dtmmr.MMRIndex(leafIndex),
+		proof,
+		root,
 	)
 }
 

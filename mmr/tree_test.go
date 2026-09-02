@@ -82,6 +82,27 @@ func TestPeakHashesAtReturnsHistoricalCommitment(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestAppendApplicationNeutralValue(t *testing.T) {
+	tree, err := New(nil)
+	require.NoError(t, err)
+
+	value := []byte("0123456789abcdef0123456789abcdef")
+	position, err := tree.Append(value)
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), position)
+	require.Equal(t, uint64(1), tree.Size())
+
+	proof, err := tree.InclusionProof(0)
+	require.NoError(t, err)
+	root, err := tree.Root()
+	require.NoError(t, err)
+	require.True(t, VerifyInclusionValue(root, tree.Size(), 0, value, proof))
+	require.False(t, VerifyInclusionValue(root, tree.Size(), 0, []byte("short"), proof))
+
+	_, err = tree.Append(nil)
+	require.EqualError(t, err, "CLL leaf value must be exactly 32 bytes")
+}
+
 func TestEmptyRootAndAdversarialInputs(t *testing.T) {
 	tree, err := New(nil)
 	require.NoError(t, err)

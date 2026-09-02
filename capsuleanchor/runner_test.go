@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ethanyzhang/capsule-ledger-go/ledger"
-	"github.com/ethanyzhang/capsule-ledger-go/store/jsonl"
+	"github.com/ethanyzhang/cll-go/ledger"
+	"github.com/ethanyzhang/cll-go/store/jsonl"
 	"github.com/stretchr/testify/require"
 )
 

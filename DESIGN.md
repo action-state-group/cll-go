@@ -1,14 +1,15 @@
-# capsule-ledger-go design
+# cll-go design
 
 Status: implementation contract for the first release. This document separates
 verified upstream behavior from choices made by this repository.
 
 ## Purpose and ownership
 
-`capsule-ledger-go` is an embeddable Go library containing an append-only AAC
-format-4 Capsule ledger and a Checkpointed Local Log (CLL). The CLL commits the
-ordered Capsule stream to an MMR, signs checkpoints, and optionally pushes them
-to external witnesses.
+`cll-go` is an embeddable Go library for application-neutral ordered entries,
+MMR commitments, signed checkpoints, and optional external witnessing. Its AAC
+format-4 Capsule ledger is one binding:
+it verifies and stores Capsules, then projects each verified Capsule ID as the
+exact bytes of one generic CLL entry.
 
 Alchemy owns its investigation workflow, GitHub publication, application
 profile, MySQL outbox, retries, and signer authorization.
@@ -55,7 +56,7 @@ private application profile. The ledger does not interpret it.
 - A verified envelope public key is evidence, not application authorization.
 - Adding an envelope allocates no Capsule sequence and adds no CLL leaf.
 - Initial Capsule plus initial envelopes is one atomic operation.
-- CLL reads only `LogSource`; it knows nothing about Alchemy's outbox or a
+- CLL reads only `cll.Source`; it knows nothing about Alchemy's outbox or a
   concrete database.
 - JSONL, SQLite, and MySQL expose the same success, idempotency, conflict,
   ordering, and read-back semantics.
@@ -131,6 +132,13 @@ findings remain visible and non-gating.
 
 ## Durable store and CLL boundaries
 
+The application-neutral `cll.Entry` carries a dense, 1-based sequence, an
+exact 32-byte record identity, and a non-zero append time. `cll.Source` exposes
+bounded ordered batches through `ScanEntries`. The checkpoint runner's
+`checkpoint.Store` combines that source with `ledger.CLLStore`. The following
+additional contracts are the AAC ledger adapter; `LogSource.ScanIDs` is a
+compatibility projection and is not required by a generic CLL source.
+
 ```go
 type Store interface {
     CheckpointStore
@@ -149,6 +157,7 @@ type Rebaseliner interface {
 
 type LogSource interface {
     ScanIDs(ctx context.Context, afterSeq uint64, limit int) ([]LogEntry, error)
+    cll.Source
 }
 
 type CheckpointStore interface {
@@ -179,15 +188,17 @@ offsets. Outcomes distinguish inserted and idempotent results. Typed errors
 distinguish not-found, invalid input, exact-byte conflict, corruption,
 closed stores, and retryable contention.
 
-`CommitCLL` atomically persists new MMR nodes, the indexed Capsule cursor, the
+`CommitCLL` atomically persists new MMR nodes, the indexed entry cursor, the
 first-uncheckpointed timestamp, an optional new checkpoint, and one pending row
 per configured witness. This prevents a durable checkpoint from becoming
 separated from retry obligations. `CLLMutation.ExpectedIndexedSeq` is a
 compare-and-swap guard. A stale writer receives `ErrConflict`, reloads
 `CLLState`, and recomputes instead of treating a second mutation as a blind
 idempotent write.
-The `LogSource` implementation uses the narrow `Store.ScanIDs` projection so it
-never loads Capsule or envelope bodies. The checkpoint runner rejects a batch
+The AAC `LogSource` implementation uses the narrow `Store.ScanIDs` projection
+to implement `cll.Source.ScanEntries`, decoding each verified Capsule ID into
+exact 32-byte entry data without loading Capsule or envelope bodies. The
+checkpoint runner rejects a batch
 whose first sequence is not `afterSeq+1` or whose entries are not contiguous.
 
 ```go
@@ -274,17 +285,21 @@ concurrent-supersedes findings.
 
 ## CLL and MMR
 
-The CLL commits only ordered Capsule IDs, preserving current Python behavior:
+The generic CLL leaf rule commits application-defined 32-byte record
+identities. Fixed width keeps the `0x00` leaf prefix domain-separated from the
+72-byte interior-node preimage while preserving existing vectors:
 
 ```text
-leaf = SHA256(0x00 || bytes.fromhex(capsule_id))
+leaf = SHA256(0x00 || entry_value_32)
 parent = SHA256(be64(parent_position + 1) || left || right)
 root = bag peaks right-to-left with SHA256(right || left)
 ```
 
-`mmr_size` counts MMR nodes, not Capsules and not ledger sequences. Envelope
-associations are not covered by this MMR. If that is later required, it gets a
-separately versioned association-event log rather than a changed leaf preimage.
+The AAC binding sets `entry_value_32 = bytes.fromhex(capsule_id)`, preserving the
+current Python behavior and every existing checkpoint vector. `mmr_size` counts
+MMR nodes, not application records or local sequences. Envelope associations
+are not covered by this MMR. If that is later required, it gets a separately
+versioned association-event log rather than a changed leaf preimage.
 
 The implementation uses DataTrails' bagged API only: `AddHashedLeaf`,
 `GetRoot`, `InclusionProofBagged`, `VerifyInclusionBagged`, and the bagged
