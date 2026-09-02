@@ -43,6 +43,9 @@ refreshed on 2026-09-01 for stored-Capsule interoperability:
 The Alchemy mapping `urn:alchemy:aac:investigation-publication:v1` is a separate
 private application profile. The ledger does not interpret it.
 
+These revisions record the implementation baseline. CI interoperability jobs
+intentionally test the current change against each peer repository's `main`.
+
 ## Invariants
 
 - A Capsule is immutable and identified by its verified lowercase 64-hex
