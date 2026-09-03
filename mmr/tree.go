@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	dtmmr "github.com/datatrails/go-datatrails-merklelog/mmr"
+	"github.com/fxamacker/cbor/v2"
 )
 
 const hashSize = sha256.Size
@@ -234,6 +235,28 @@ func RootFromPeaks(peaks [][]byte) []byte {
 		return make([]byte, hashSize)
 	}
 	return dtmmr.HashPeaksRHS(sha256.New(), cloneProof(peaks))
+}
+
+// CommitmentObject returns the canonical CBOR encoding of ordered MMR peaks
+// carried by the CLL checkpoint wire profile.
+func CommitmentObject(peaks [][]byte) ([]byte, error) {
+	if peaks == nil {
+		peaks = [][]byte{}
+	}
+	for _, peak := range peaks {
+		if len(peak) != hashSize {
+			return nil, fmt.Errorf("MMR peaks must be 32 bytes")
+		}
+	}
+	mode, err := cbor.CanonicalEncOptions().EncMode()
+	if err != nil {
+		return nil, fmt.Errorf("create canonical CBOR encoder: %w", err)
+	}
+	encoded, err := mode.Marshal(peaks)
+	if err != nil {
+		return nil, fmt.Errorf("encode MMR commitment: %w", err)
+	}
+	return encoded, nil
 }
 
 type pathStep struct {

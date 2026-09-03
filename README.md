@@ -151,6 +151,16 @@ durable cursors and polling recover lost notifications and restarts.
 Checkpoint COSE records remain byte-compatible with the TypeScript and Python
 CLL implementations.
 
+The `mmr` and `checkpoint` packages expose the same core inspection capabilities
+as the TypeScript package. `mmr.CommitmentObject` returns the canonical CBOR
+commitment carried by checkpoints; `checkpoint.ParseRecord` returns validated
+metadata, including an optional `Record.Cadence`, and `Record.EntryHash` derives
+the RFC 9162 witness entry identity. `Ed25519Signer.SignCheckpointWithCadence`
+emits that optional maximum interval in seconds while the existing `Signer`
+interface and `SignCheckpoint` path remain compatible.
+Names and error handling remain idiomatic to Go rather than mirroring TypeScript
+signatures literally.
+
 ## External witnesses
 
 The `witness` package contains a bounded HTTP client, offline RFC 9162 receipt

@@ -149,7 +149,8 @@ const ContentType = "application/cll-checkpoint+cbor"
 const wireKind = "cll-checkpoint"
 
 // Record is a verified-shape CLL checkpoint decoded from its COSE_Sign1 wire
-// statement. NewPeaks and PrevPeaks are the ordered commitment accumulators.
+// statement. Cadence is the optional positive maximum checkpoint interval in
+// seconds. NewPeaks and PrevPeaks are the ordered commitment accumulators.
 type Record struct {
 	Version          uint64
 	Kind             string
@@ -160,6 +161,7 @@ type Record struct {
 	PrevRoot         string
 	KeyID            string
 	Timestamp        time.Time
+	Cadence          *uint64
 	NewPeaks         [][]byte
 	PrevPeaks        [][]byte
 	ConsistencyProof *mmr.ConsistencyProof
@@ -238,6 +240,10 @@ func ParseRecord(data []byte) (Record, error) {
 		PrevRoot: hex.EncodeToString(rootFromPeaks(prevPeaks)), KeyID: hex.EncodeToString(kid),
 		Timestamp: timestamp, NewPeaks: clonePeaks(newPeaks), PrevPeaks: clonePeaks(prevPeaks),
 		statement: append([]byte(nil), data...),
+	}
+	if wire.Cadence != nil {
+		cadence := *wire.Cadence
+		record.Cadence = &cadence
 	}
 	if wire.ConsistencyProof != nil {
 		record.ConsistencyProof = &mmr.ConsistencyProof{
@@ -320,6 +326,16 @@ func NewEd25519Signer(private ed25519.PrivateKey) (*Ed25519Signer, error) {
 func (s *Ed25519Signer) KeyID() string { return hex.EncodeToString(s.public) }
 
 func (s *Ed25519Signer) SignCheckpoint(ctx context.Context, payload []byte, newPeaks, prevPeaks [][]byte, proof *mmr.ConsistencyProof) ([]byte, error) {
+	return s.signCheckpoint(ctx, payload, newPeaks, prevPeaks, proof, nil)
+}
+
+// SignCheckpointWithCadence signs a checkpoint carrying the producer's
+// positive, portable maximum checkpoint interval in seconds.
+func (s *Ed25519Signer) SignCheckpointWithCadence(ctx context.Context, payload []byte, newPeaks, prevPeaks [][]byte, proof *mmr.ConsistencyProof, cadence uint64) ([]byte, error) {
+	return s.signCheckpoint(ctx, payload, newPeaks, prevPeaks, proof, &cadence)
+}
+
+func (s *Ed25519Signer) signCheckpoint(ctx context.Context, payload []byte, newPeaks, prevPeaks [][]byte, proof *mmr.ConsistencyProof, cadence *uint64) ([]byte, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -327,7 +343,7 @@ func (s *Ed25519Signer) SignCheckpoint(ctx context.Context, payload []byte, newP
 	if err != nil || parsed.KeyID != s.KeyID() {
 		return nil, fmt.Errorf("checkpoint payload key does not match signer")
 	}
-	claims, err := encodeWireClaims(parsed, newPeaks, prevPeaks, proof)
+	claims, err := encodeWireClaims(parsed, newPeaks, prevPeaks, proof, cadence)
 	if err != nil {
 		return nil, err
 	}
@@ -400,9 +416,12 @@ var canonicalCBOR = func() cbor.EncMode {
 	return mode
 }()
 
-func encodeWireClaims(payload Payload, newPeaks, prevPeaks [][]byte, proof *mmr.ConsistencyProof) ([]byte, error) {
+func encodeWireClaims(payload Payload, newPeaks, prevPeaks [][]byte, proof *mmr.ConsistencyProof, cadence *uint64) ([]byte, error) {
 	if err := validatePeakCommitments(payload, newPeaks, prevPeaks); err != nil {
 		return nil, err
+	}
+	if cadence != nil && (*cadence == 0 || *cadence > cll.MaxPortableInteger) {
+		return nil, fmt.Errorf("checkpoint cadence must be a positive portable integer")
 	}
 	if payload.PrevSize == 0 && proof != nil {
 		return nil, fmt.Errorf("first checkpoint cannot carry a consistency proof")
@@ -414,13 +433,13 @@ func encodeWireClaims(payload Payload, newPeaks, prevPeaks [][]byte, proof *mmr.
 			return nil, fmt.Errorf("checkpoint consistency proof is required and must bridge the declared checkpoints")
 		}
 	}
-	newCommitment, err := canonicalCBOR.Marshal(newPeaks)
+	newCommitment, err := mmr.CommitmentObject(newPeaks)
 	if err != nil {
 		return nil, err
 	}
 	previousCommitment := []byte{}
 	if payload.PrevSize > 0 {
-		previousCommitment, err = canonicalCBOR.Marshal(prevPeaks)
+		previousCommitment, err = mmr.CommitmentObject(prevPeaks)
 		if err != nil {
 			return nil, err
 		}
@@ -432,7 +451,7 @@ func encodeWireClaims(payload Payload, newPeaks, prevPeaks [][]byte, proof *mmr.
 	claims := wireClaims{
 		Kind: wireKind, LogSize: payload.MMRSize, Commitment: newCommitment,
 		PrevSize: payload.PrevSize, PrevCommitment: previousCommitment,
-		IssuedAt: timestamp,
+		IssuedAt: timestamp, Cadence: cadence,
 	}
 	if proof != nil {
 		claims.ConsistencyProof = &wireConsistencyProof{
@@ -460,6 +479,9 @@ func decodeWireClaims(data []byte) (wireClaims, error) {
 	if claims.Kind != wireKind || claims.LogSize == 0 || len(claims.Commitment) == 0 || claims.IssuedAt == "" {
 		return wireClaims{}, fmt.Errorf("checkpoint claims are invalid")
 	}
+	if claims.Cadence != nil && (*claims.Cadence == 0 || *claims.Cadence > cll.MaxPortableInteger) {
+		return wireClaims{}, fmt.Errorf("checkpoint cadence must be a positive portable integer")
+	}
 	return claims, nil
 }
 
@@ -473,14 +495,9 @@ func decodeCommitment(data []byte, name string) ([][]byte, error) {
 	if err := mode.Unmarshal(data, &peaks); err != nil {
 		return nil, fmt.Errorf("decode checkpoint %s: %w", name, err)
 	}
-	encoded, err := canonicalCBOR.Marshal(peaks)
+	encoded, err := mmr.CommitmentObject(peaks)
 	if err != nil || !bytes.Equal(encoded, data) {
 		return nil, fmt.Errorf("checkpoint %s is not canonical", name)
-	}
-	for _, peak := range peaks {
-		if len(peak) != sha256.Size {
-			return nil, fmt.Errorf("checkpoint %s contains an invalid peak", name)
-		}
 	}
 	return peaks, nil
 }

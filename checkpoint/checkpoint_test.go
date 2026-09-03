@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/action-state-group/cll-go/cll"
 	"github.com/action-state-group/cll-go/mmr"
 	"github.com/stretchr/testify/require"
 )
@@ -37,6 +38,7 @@ func TestCheckpointCanonicalSignAndVerify(t *testing.T) {
 	record, err := ParseRecord(statement)
 	require.NoError(t, err)
 	require.Equal(t, signer.KeyID(), record.KeyID)
+	require.Nil(t, record.Cadence)
 	require.NoError(t, record.VerifySignature())
 	require.NoError(t, signer.VerifyCheckpoint(payload, statement))
 	tampered := bytes.Replace(payload, []byte("alchemy"), []byte("changed"), 1)
@@ -200,6 +202,44 @@ func TestDecodeWireClaimsAcceptsCanonicalCadence(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, claims.Cadence)
 	require.Equal(t, cadence, *claims.Cadence)
+}
+
+func TestDecodeWireClaimsRejectsInvalidCadence(t *testing.T) {
+	commitment, err := canonicalCBOR.Marshal([][]byte{bytes.Repeat([]byte{0xab}, 32)})
+	require.NoError(t, err)
+	for _, cadence := range []uint64{0, cll.MaxPortableInteger + 1} {
+		encoded, err := canonicalCBOR.Marshal(wireClaims{
+			Kind: wireKind, LogSize: 1, Commitment: commitment,
+			IssuedAt: "2026-08-27T12:34:56Z", Cadence: &cadence,
+		})
+		require.NoError(t, err)
+		_, err = decodeWireClaims(encoded)
+		require.ErrorContains(t, err, "positive portable integer")
+	}
+}
+
+func TestSignCheckpointWithCadence(t *testing.T) {
+	signer, err := NewEd25519Signer(ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize)))
+	require.NoError(t, err)
+	peak := bytes.Repeat([]byte{0xab}, 32)
+	payload, err := (Payload{
+		LogID: "cadence-log", KeyID: signer.KeyID(), MMRSize: 1,
+		Root: hex.EncodeToString(peak), Timestamp: time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC),
+	}).CanonicalJSON()
+	require.NoError(t, err)
+
+	statement, err := signer.SignCheckpointWithCadence(t.Context(), payload, [][]byte{peak}, nil, nil, 250)
+	require.NoError(t, err)
+	record, err := ParseRecord(statement)
+	require.NoError(t, err)
+	require.NotNil(t, record.Cadence)
+	require.Equal(t, uint64(250), *record.Cadence)
+	require.NoError(t, record.VerifySignature())
+
+	_, err = signer.SignCheckpointWithCadence(t.Context(), payload, [][]byte{peak}, nil, nil, 0)
+	require.ErrorContains(t, err, "positive portable integer")
+	_, err = signer.SignCheckpointWithCadence(t.Context(), payload, [][]byte{peak}, nil, nil, cll.MaxPortableInteger+1)
+	require.ErrorContains(t, err, "positive portable integer")
 }
 
 func TestParseRecordRejectsTamperedCOSESignature(t *testing.T) {

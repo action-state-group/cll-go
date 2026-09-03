@@ -36,7 +36,7 @@ written:
 
 | Repository | Commit | Contract used here |
 | --- | --- | --- |
-| `action-state-group/cll-ts` | `749c5aa7411dd30caed3595cec8d8f54612fdb8f` | Generic API, state transitions, JSONL v4, SQLite and MySQL schemas |
+| `action-state-group/cll-ts` | `91b88ca17e452eeb5994bd98bd514db7f02db814` | Generic API, state transitions, JSONL v4, SQLite and MySQL schemas |
 | `action-state-group/checkpointed-local-log` | `f0f60baec7b19a2288de18283ffb715da0cdcd9c` | Generic log discipline and Python MMR/checkpoint verification |
 | `action-state-group/capsule-anchor` | `8207b79ce2dd3eb1fce105d52162959e1d5aa680` | `/checkpoints` request and RFC 9162 receipt behavior |
 | `action-state-group/capsule-emit-ts` | `984471ac310f249d5b3d0594a64db97f98adec17` | AAC application integration boundary |
@@ -446,15 +446,21 @@ from the indexed entry rows, verifies dense ordering, and inserts the new entry.
 MMR size is never used as an entry sequence because MMR size counts nodes, not
 entries.
 
-Reads stay incremental in Go:
+Reads stay incremental in both Go and TypeScript:
 
 - `GetEntry` queries by `(log_id, value)`.
 - `ScanEntries` queries the requested sequence range.
-- `LoadCLL` reads metadata, nodes, and witnesses, not record entries.
+- `LoadCLL`/`loadCll` read metadata, nodes, and witnesses, not record entries.
 - Commits insert only new nodes and witnesses.
 
-This differs internally from the current TypeScript snapshot refresh but is
-observably equivalent and uses the same durable rows.
+Each runtime validates complete relational state when opening a backend. Normal
+append, entry lookup, bounded scan, witness lookup, and witness CAS operations
+use targeted indexed queries. Public capabilities align semantically while
+retaining idiomatic Go and TypeScript names, numeric types, and error handling.
+Both checkpoint APIs can emit and inspect the optional positive maximum
+checkpoint interval in seconds. Go exposes the additive
+`SignCheckpointWithCadence` method without widening the runner's existing
+`Signer` interface.
 
 ## Legacy format policy
 

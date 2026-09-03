@@ -186,11 +186,12 @@ func failedWitness(item cll.WitnessState, now time.Time, permanent bool, reason 
 
 func (r *DeliveryRunner) backoff(attempts uint32) time.Duration {
 	delay := r.config.BaseBackoff
-	for count := uint32(0); count < attempts && delay < r.config.MaxBackoff/2; count++ {
-		delay *= 2
-	}
-	if delay > r.config.MaxBackoff {
-		delay = r.config.MaxBackoff
+	for count := uint32(0); count < attempts && delay < r.config.MaxBackoff; count++ {
+		if delay > r.config.MaxBackoff-delay {
+			delay = r.config.MaxBackoff
+		} else {
+			delay *= 2
+		}
 	}
 	if r.config.Jitter && delay > 0 {
 		delay = time.Duration(rand.Int64N(int64(delay)))

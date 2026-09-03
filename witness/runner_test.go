@@ -29,6 +29,15 @@ func TestDeliveryRunnerJitterSupportsMaximumDuration(t *testing.T) {
 	})
 }
 
+func TestDeliveryRunnerBackoffReachesNonPowerOfTwoMaximum(t *testing.T) {
+	config := DefaultDeliveryConfig()
+	config.BaseBackoff = time.Second
+	config.MaxBackoff = 2500 * time.Millisecond
+	config.Jitter = false
+	runner := &DeliveryRunner{config: config}
+	require.Equal(t, config.MaxBackoff, runner.backoff(2))
+}
+
 type fakeSubmitter struct {
 	receipt Receipt
 	err     error

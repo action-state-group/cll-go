@@ -1,6 +1,7 @@
 package mmr
 
 import (
+	"bytes"
 	"fmt"
 	"testing"
 
@@ -101,6 +102,20 @@ func TestAppendApplicationNeutralValue(t *testing.T) {
 
 	_, err = tree.Append(nil)
 	require.EqualError(t, err, "CLL leaf value must be exactly 32 bytes")
+}
+
+func TestCommitmentObject(t *testing.T) {
+	empty, err := CommitmentObject(nil)
+	require.NoError(t, err)
+	require.Equal(t, []byte{0x80}, empty)
+
+	peaks := [][]byte{bytes.Repeat([]byte{0xab}, 32)}
+	encoded, err := CommitmentObject(peaks)
+	require.NoError(t, err)
+	require.Equal(t, append([]byte{0x81, 0x58, 0x20}, peaks[0]...), encoded)
+
+	_, err = CommitmentObject([][]byte{{1}})
+	require.Error(t, err)
 }
 
 func TestEmptyRootAndAdversarialInputs(t *testing.T) {
