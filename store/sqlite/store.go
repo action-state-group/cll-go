@@ -1,842 +1,585 @@
 package sqlite
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"slices"
-	"strings"
+	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/action-state-group/cll-go/cll"
-	"github.com/action-state-group/cll-go/ledger"
-	"github.com/action-state-group/cll-go/mmr"
-	sqliteDriver "modernc.org/sqlite"
+	"github.com/action-state-group/cll-go/internal/backend"
+	"github.com/action-state-group/cll-go/internal/portable"
+	modernsqlite "modernc.org/sqlite"
 )
 
-const schemaVersion = 3
-
 const schema = `
-PRAGMA journal_mode=WAL;
-PRAGMA foreign_keys=ON;
-PRAGMA busy_timeout=5000;
-CREATE TABLE IF NOT EXISTS schema_metadata (
-  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-  version INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS ledger_metadata (
+CREATE TABLE IF NOT EXISTS cll_meta (
   log_id TEXT PRIMARY KEY,
-  next_seq INTEGER NOT NULL CHECK (next_seq > 0),
-  indexed_seq INTEGER NOT NULL DEFAULT 0,
-  first_uncheckpointed TEXT NOT NULL DEFAULT ''
-  ,active INTEGER NOT NULL DEFAULT 1
-  ,force_checkpoint INTEGER NOT NULL DEFAULT 0
+  state BLOB NOT NULL
 );
-CREATE TABLE IF NOT EXISTS capsules (
+CREATE TABLE IF NOT EXISTS cll_entries (
   log_id TEXT NOT NULL,
   seq INTEGER NOT NULL,
-  capsule_id TEXT NOT NULL,
-  capsule BLOB NOT NULL,
-  authenticity TEXT NOT NULL CHECK (authenticity IN ('unsigned','signed')),
-  verification BLOB NOT NULL,
-  parent_id TEXT NOT NULL,
+  value BLOB NOT NULL,
   appended_at TEXT NOT NULL,
-  PRIMARY KEY (log_id, seq),
-  UNIQUE (log_id, capsule_id),
-  FOREIGN KEY (log_id) REFERENCES ledger_metadata(log_id)
+  PRIMARY KEY(log_id, seq),
+  UNIQUE(log_id, value)
 );
-CREATE TABLE IF NOT EXISTS envelopes (
+CREATE TABLE IF NOT EXISTS cll_nodes (
   log_id TEXT NOT NULL,
-  capsule_id TEXT NOT NULL,
-  digest TEXT NOT NULL,
-  envelope BLOB NOT NULL,
-  verification BLOB NOT NULL,
-  added_at TEXT NOT NULL,
-  PRIMARY KEY (log_id, capsule_id, digest),
-  FOREIGN KEY (log_id, capsule_id) REFERENCES capsules(log_id, capsule_id)
+  position INTEGER NOT NULL,
+  node BLOB NOT NULL,
+  PRIMARY KEY(log_id, position)
 );
-CREATE INDEX IF NOT EXISTS capsules_parent ON capsules(log_id, parent_id);
-CREATE TABLE IF NOT EXISTS mmr_nodes (
-  log_id TEXT NOT NULL, position INTEGER NOT NULL, hash BLOB NOT NULL,
-  PRIMARY KEY (log_id, position), FOREIGN KEY (log_id) REFERENCES ledger_metadata(log_id)
-);
-CREATE TABLE IF NOT EXISTS checkpoints (
-  log_id TEXT NOT NULL, mmr_size INTEGER NOT NULL, indexed_seq INTEGER NOT NULL,
-  root TEXT NOT NULL, payload BLOB NOT NULL, signed_checkpoint BLOB NOT NULL, created_at TEXT NOT NULL,
-  PRIMARY KEY (log_id, mmr_size), FOREIGN KEY (log_id) REFERENCES ledger_metadata(log_id)
-);
-CREATE TABLE IF NOT EXISTS witness_deliveries (
-  log_id TEXT NOT NULL, witness_id TEXT NOT NULL, mmr_size INTEGER NOT NULL,
-  state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT NOT NULL DEFAULT '',
-  attempted_at TEXT NOT NULL DEFAULT '', last_error TEXT NOT NULL DEFAULT '', receipt BLOB,
-  PRIMARY KEY (log_id, witness_id, mmr_size),
-  FOREIGN KEY (log_id, mmr_size) REFERENCES checkpoints(log_id, mmr_size)
-);
-CREATE TABLE IF NOT EXISTS rebaselines (
-  migration_id TEXT PRIMARY KEY, old_log_id TEXT NOT NULL, new_log_id TEXT NOT NULL UNIQUE,
-  reason TEXT NOT NULL, migrated_at TEXT NOT NULL, last_witnessed_size INTEGER NOT NULL
-);
-`
+CREATE TABLE IF NOT EXISTS cll_witnesses (
+  log_id TEXT NOT NULL,
+  witness_id TEXT NOT NULL,
+  checkpoint_size TEXT NOT NULL,
+  attempts INTEGER NOT NULL,
+  witness BLOB NOT NULL,
+  PRIMARY KEY(log_id, witness_id, checkpoint_size)
+);`
 
-// Store persists log state in an embedded SQLite database.
-type Store struct {
-	mu     sync.RWMutex
-	db     *sql.DB
-	logID  string
-	closed bool
+type sharedLock struct {
+	mu   sync.Mutex
+	refs int
 }
 
-// Open opens or creates a SQLite database bound to logID.
+var sharedLocks = struct {
+	sync.Mutex
+	items map[string]*sharedLock
+}{items: make(map[string]*sharedLock)}
+
+// Store is a transactional SQLite implementation of cll.Backend.
+type Store struct {
+	lifecycle sync.RWMutex
+	db        *sql.DB
+	logID     string
+	lockKey   string
+	shared    *sharedLock
+	closed    bool
+}
+
+// Open opens one logical log in a SQLite database.
 func Open(path, logID string) (*Store, error) {
-	if path == "" || ledger.ValidateIdentifier(logID) != nil {
-		return nil, fmt.Errorf("%w: path and log id are required", ledger.ErrInvalid)
+	if path == "" || cll.ValidateIdentifier(logID) != nil {
+		return nil, fmt.Errorf("%w: database path and log ID are required", cll.ErrInvalid)
 	}
-	separator := "?"
-	if strings.Contains(path, "?") {
-		separator = "&"
-	}
-	dsn := path + separator + "_journal_mode=wal&_foreign_keys=on&_busy_timeout=5000&_txlock=immediate"
-	db, err := sql.Open("sqlite", dsn)
+	absolute, err := filepath.Abs(path)
 	if err != nil {
-		return nil, fmt.Errorf("open SQLite store: %w", err)
+		return nil, fmt.Errorf("resolve SQLite path: %w", err)
+	}
+	key := filepath.Clean(absolute) + "\x00" + logID
+	lock := acquireShared(key)
+	lock.mu.Lock()
+	defer lock.mu.Unlock()
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		releaseShared(key)
+		return nil, err
 	}
 	db.SetMaxOpenConns(1)
+	store := &Store{db: db, logID: logID, lockKey: key, shared: lock}
+	for _, pragma := range []string{"PRAGMA journal_mode=WAL", "PRAGMA foreign_keys=ON", "PRAGMA busy_timeout=5000"} {
+		if _, err := db.Exec(pragma); err != nil {
+			return nil, closeOpenFailure(db, key, classify(err))
+		}
+	}
+	legacy, err := sqliteTableExists(context.Background(), db, "ledger_metadata")
+	if err != nil {
+		return nil, closeOpenFailure(db, key, classify(err))
+	}
+	if legacy {
+		return nil, closeOpenFailure(db, key, fmt.Errorf("%w: legacy application storage requires application-owned migration", cll.ErrCorrupt))
+	}
 	if _, err := db.Exec(schema); err != nil {
-		return nil, errors.Join(fmt.Errorf("initialize SQLite store: %w", err), db.Close())
+		return nil, closeOpenFailure(db, key, classify(err))
 	}
-	if _, err := db.Exec(`INSERT INTO schema_metadata(singleton,version) VALUES(1,?) ON CONFLICT(singleton) DO NOTHING`, schemaVersion); err != nil {
-		return nil, errors.Join(fmt.Errorf("initialize SQLite schema version: %w", err), db.Close())
+	empty, err := backend.MarshalMetadata(cll.State{})
+	if err != nil {
+		return nil, closeOpenFailure(db, key, err)
 	}
-	var version int
-	if err := db.QueryRow(`SELECT version FROM schema_metadata WHERE singleton=1`).Scan(&version); err != nil || version != schemaVersion {
-		return nil, errors.Join(fmt.Errorf("unsupported SQLite schema version %d: %w", version, ledger.ErrCorrupt), err, db.Close())
+	if _, err := db.Exec("INSERT OR IGNORE INTO cll_meta(log_id,state) VALUES(?,?)", logID, empty); err != nil {
+		return nil, closeOpenFailure(db, key, classify(err))
 	}
-	if _, err := db.Exec(`INSERT INTO ledger_metadata(log_id, next_seq) VALUES (?, 1) ON CONFLICT(log_id) DO NOTHING`, logID); err != nil {
-		return nil, errors.Join(fmt.Errorf("initialize SQLite log: %w", err), db.Close())
+	if err := validateOpenState(context.Background(), db, logID); err != nil {
+		return nil, closeOpenFailure(db, key, err)
 	}
-	var active bool
-	if err := db.QueryRow(`SELECT active FROM ledger_metadata WHERE log_id=?`, logID).Scan(&active); err != nil || !active {
-		return nil, errors.Join(fmt.Errorf("open inactive SQLite log: %w", ledger.ErrInvalid), err, db.Close())
-	}
-	return &Store{db: db, logID: logID}, nil
+	return store, nil
 }
 
-func (s *Store) Append(ctx context.Context, in ledger.AppendInput) (_ ledger.Record, _ ledger.AppendOutcome, finalErr error) {
-	defer func() { finalErr = classifySQLite(finalErr) }()
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.closed {
-		return ledger.Record{}, "", ledger.ErrClosed
-	}
-	in = in.Normalized()
-	if err := in.Validate(); err != nil {
-		return ledger.Record{}, "", err
-	}
-	verification, err := json.Marshal(in.Verification)
-	if err != nil {
-		return ledger.Record{}, "", fmt.Errorf("encode verification: %w", err)
-	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return ledger.Record{}, "", err
-	}
-	defer func() { _ = tx.Rollback() }()
-	if err := ensureActive(ctx, tx, s.logID); err != nil {
-		return ledger.Record{}, "", err
-	}
-	if existing, getErr := get(ctx, tx, s.logID, in.CapsuleID); getErr == nil {
-		if existing.Authenticity != in.Authenticity || !bytes.Equal(existing.Capsule, in.Capsule) || !sameEnvelopes(existing.Envelopes, in.Envelopes) {
-			return ledger.Record{}, "", ledger.ErrConflict
+func validateOpenState(ctx context.Context, db *sql.DB, logID string) error {
+	return runTransaction(ctx, db, "BEGIN", func(conn *sql.Conn) error {
+		if err := validateEntries(ctx, conn, logID); err != nil {
+			return err
 		}
-		return existing, ledger.AppendIdempotent, nil
-	} else if !errors.Is(getErr, ledger.ErrNotFound) {
-		return ledger.Record{}, "", getErr
-	}
-	var seq uint64
-	var active bool
-	if err := tx.QueryRowContext(ctx, `SELECT next_seq,active FROM ledger_metadata WHERE log_id = ?`, s.logID).Scan(&seq, &active); err != nil {
-		return ledger.Record{}, "", err
-	}
-	if !active {
-		return ledger.Record{}, "", ledger.ErrConflict
-	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO capsules(log_id,seq,capsule_id,capsule,authenticity,verification,parent_id,appended_at) VALUES(?,?,?,?,?,?,?,?)`,
-		s.logID, seq, in.CapsuleID, in.Capsule, in.Authenticity, verification, in.ParentID, in.AppendedAt.UTC().Format(time.RFC3339Nano)); err != nil {
-		return ledger.Record{}, "", err
-	}
-	for _, envelope := range in.Envelopes {
-		if err := insertEnvelope(ctx, tx, s.logID, in.CapsuleID, envelope); err != nil {
-			return ledger.Record{}, "", err
-		}
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE ledger_metadata SET next_seq = next_seq + 1 WHERE log_id = ?`, s.logID); err != nil {
-		return ledger.Record{}, "", err
-	}
-	if err := tx.Commit(); err != nil {
-		return ledger.Record{}, "", err
-	}
-	record := ledger.Record{Seq: seq, CapsuleID: in.CapsuleID, Capsule: clone(in.Capsule), Authenticity: in.Authenticity, Envelopes: cloneEnvelopes(in.Envelopes), Verification: in.Verification.Clone(), ParentID: in.ParentID, AppendedAt: ledger.NormalizeTime(in.AppendedAt)}
-	return record.Clone(), ledger.AppendInserted, nil
-}
-
-func (s *Store) AddEnvelope(ctx context.Context, in ledger.EnvelopeInput) (_ ledger.Envelope, _ ledger.AddOutcome, finalErr error) {
-	defer func() { finalErr = classifySQLite(finalErr) }()
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.closed {
-		return ledger.Envelope{}, "", ledger.ErrClosed
-	}
-	in = in.Normalized()
-	if err := in.Validate(); err != nil {
-		return ledger.Envelope{}, "", err
-	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return ledger.Envelope{}, "", err
-	}
-	defer func() { _ = tx.Rollback() }()
-	if err := ensureActive(ctx, tx, s.logID); err != nil {
-		return ledger.Envelope{}, "", err
-	}
-	var present int
-	if err := tx.QueryRowContext(ctx, `SELECT 1 FROM capsules WHERE log_id=? AND capsule_id=?`, s.logID, in.CapsuleID).Scan(&present); errors.Is(err, sql.ErrNoRows) {
-		return ledger.Envelope{}, "", ledger.ErrNotFound
-	} else if err != nil {
-		return ledger.Envelope{}, "", err
-	}
-	var stored ledger.Envelope
-	var verification []byte
-	var addedAt string
-	err = tx.QueryRowContext(ctx, `SELECT digest,envelope,verification,added_at FROM envelopes WHERE log_id=? AND capsule_id=? AND digest=?`, s.logID, in.CapsuleID, in.Envelope.Digest).
-		Scan(&stored.Digest, &stored.Bytes, &verification, &addedAt)
-	if err == nil {
-		if !bytes.Equal(stored.Bytes, in.Envelope.Bytes) {
-			return ledger.Envelope{}, "", ledger.ErrConflict
-		}
-		if err := json.Unmarshal(verification, &stored.Verification); err != nil {
-			return ledger.Envelope{}, "", fmt.Errorf("decode stored envelope verification: %w", ledger.ErrCorrupt)
-		}
-		stored.AddedAt, err = time.Parse(time.RFC3339Nano, addedAt)
-		if err != nil {
-			return ledger.Envelope{}, "", fmt.Errorf("decode stored envelope timestamp: %w", ledger.ErrCorrupt)
-		}
-		return cloneEnvelope(stored), ledger.EnvelopeIdempotent, nil
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return ledger.Envelope{}, "", err
-	}
-	var count int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM envelopes WHERE log_id=? AND capsule_id=?`, s.logID, in.CapsuleID).Scan(&count); err != nil {
-		return ledger.Envelope{}, "", err
-	}
-	if count >= ledger.MaxEnvelopesPerCapsule {
-		return ledger.Envelope{}, "", fmt.Errorf("%w: envelope limit reached", ledger.ErrInvalid)
-	}
-	if err := insertEnvelope(ctx, tx, s.logID, in.CapsuleID, in.Envelope); err != nil {
-		return ledger.Envelope{}, "", err
-	}
-	if err := tx.Commit(); err != nil {
-		return ledger.Envelope{}, "", err
-	}
-	return cloneEnvelope(in.Envelope), ledger.EnvelopeInserted, nil
-}
-
-func insertEnvelope(ctx context.Context, tx *sql.Tx, logID string, id ledger.CapsuleID, envelope ledger.Envelope) error {
-	envelope.AddedAt = ledger.NormalizeTime(envelope.AddedAt)
-	verification, err := json.Marshal(envelope.Verification)
-	if err != nil {
+		_, err := loadState(ctx, conn, logID)
 		return err
-	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO envelopes(log_id,capsule_id,digest,envelope,verification,added_at) VALUES(?,?,?,?,?,?)`, logID, id, envelope.Digest, envelope.Bytes, verification, envelope.AddedAt.UTC().Format(time.RFC3339Nano))
-	return err
+	})
 }
 
-func (s *Store) Get(ctx context.Context, id ledger.CapsuleID) (ledger.Record, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.closed {
-		return ledger.Record{}, ledger.ErrClosed
+func closeOpenFailure(db *sql.DB, key string, cause error) error {
+	closeErr := db.Close()
+	releaseShared(key)
+	return errors.Join(cause, closeErr)
+}
+
+func acquireShared(key string) *sharedLock {
+	sharedLocks.Lock()
+	defer sharedLocks.Unlock()
+	lock := sharedLocks.items[key]
+	if lock == nil {
+		lock = &sharedLock{}
+		sharedLocks.items[key] = lock
 	}
-	return get(ctx, s.db, s.logID, id)
+	lock.refs++
+	return lock
+}
+
+func releaseShared(key string) {
+	sharedLocks.Lock()
+	defer sharedLocks.Unlock()
+	lock := sharedLocks.items[key]
+	if lock == nil {
+		return
+	}
+	lock.refs--
+	if lock.refs == 0 {
+		delete(sharedLocks.items, key)
+	}
 }
 
 type queryer interface {
-	QueryRowContext(context.Context, string, ...any) *sql.Row
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
 }
 
-func get(ctx context.Context, q queryer, logID string, id ledger.CapsuleID) (ledger.Record, error) {
-	var record ledger.Record
-	var verification []byte
-	var parent string
-	var appended string
-	err := q.QueryRowContext(ctx, `SELECT seq,capsule_id,capsule,authenticity,verification,parent_id,appended_at FROM capsules WHERE log_id=? AND capsule_id=?`, logID, id).Scan(&record.Seq, &record.CapsuleID, &record.Capsule, &record.Authenticity, &verification, &parent, &appended)
+func sqliteTableExists(ctx context.Context, q queryer, name string) (bool, error) {
+	var found int
+	err := q.QueryRowContext(ctx, "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", name).Scan(&found)
 	if errors.Is(err, sql.ErrNoRows) {
-		return ledger.Record{}, ledger.ErrNotFound
+		return false, nil
 	}
-	if err != nil {
-		return ledger.Record{}, err
-	}
-	record.ParentID = ledger.CapsuleID(parent)
-	if err := json.Unmarshal(verification, &record.Verification); err != nil {
-		return ledger.Record{}, fmt.Errorf("decode verification: %w", err)
-	}
-	if record.AppendedAt, err = time.Parse(time.RFC3339Nano, appended); err != nil {
-		return ledger.Record{}, err
-	}
-	rows, err := q.QueryContext(ctx, `SELECT digest,envelope,verification,added_at FROM envelopes WHERE log_id=? AND capsule_id=? ORDER BY digest`, logID, id)
-	if err != nil {
-		return ledger.Record{}, err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var envelope ledger.Envelope
-		var encoded []byte
-		var added string
-		if err := rows.Scan(&envelope.Digest, &envelope.Bytes, &encoded, &added); err != nil {
-			return ledger.Record{}, err
-		}
-		if err := json.Unmarshal(encoded, &envelope.Verification); err != nil {
-			return ledger.Record{}, err
-		}
-		if envelope.AddedAt, err = time.Parse(time.RFC3339Nano, added); err != nil {
-			return ledger.Record{}, err
-		}
-		record.Envelopes = append(record.Envelopes, envelope)
-	}
-	if err := rows.Err(); err != nil {
-		return ledger.Record{}, err
-	}
-	if err := record.Validate(); err != nil {
-		return ledger.Record{}, fmt.Errorf("decode stored record: %w: %v", ledger.ErrCorrupt, err)
-	}
-	return record, nil
+	return err == nil, err
 }
 
-func (s *Store) Scan(ctx context.Context, after uint64, limit int) ([]ledger.Record, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *Store) withRead(ctx context.Context, operation func(queryer) error) error {
+	return s.withTransaction(ctx, "BEGIN", func(conn *sql.Conn) error {
+		return operation(conn)
+	})
+}
+
+func (s *Store) withWrite(ctx context.Context, operation func(*sql.Conn) error) error {
+	return s.withTransaction(ctx, "BEGIN IMMEDIATE", operation)
+}
+
+func (s *Store) withTransaction(ctx context.Context, begin string, operation func(*sql.Conn) error) error {
+	s.lifecycle.RLock()
+	defer s.lifecycle.RUnlock()
 	if s.closed {
-		return nil, ledger.ErrClosed
+		return cll.ErrClosed
 	}
-	if limit <= 0 || limit > ledger.MaxScanLimit {
-		return nil, ledger.ErrInvalid
-	}
-	rows, err := s.db.QueryContext(ctx, `SELECT capsule_id FROM capsules WHERE log_id=? AND seq>? ORDER BY seq LIMIT ?`, s.logID, after, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var ids []ledger.CapsuleID
-	for rows.Next() {
-		var id ledger.CapsuleID
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		ids = append(ids, id)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	if err := rows.Close(); err != nil {
-		return nil, err
-	}
-	result := make([]ledger.Record, 0, len(ids))
-	for _, id := range ids {
-		record, err := get(ctx, s.db, s.logID, id)
-		if err != nil {
-			return nil, err
-		}
-		result = append(result, record)
-	}
-	return result, nil
+	s.shared.mu.Lock()
+	defer s.shared.mu.Unlock()
+	return runTransaction(ctx, s.db, begin, operation)
 }
 
-func (s *Store) ScanIDs(ctx context.Context, after uint64, limit int) ([]ledger.LogEntry, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.closed {
-		return nil, ledger.ErrClosed
-	}
-	if limit <= 0 || limit > ledger.MaxScanLimit {
-		return nil, ledger.ErrInvalid
-	}
-	rows, err := s.db.QueryContext(ctx, `SELECT seq,capsule_id,appended_at FROM capsules WHERE log_id=? AND seq>? ORDER BY seq LIMIT ?`, s.logID, after, limit)
+func runTransaction(ctx context.Context, db *sql.DB, begin string, operation func(*sql.Conn) error) (err error) {
+	conn, err := db.Conn(ctx)
 	if err != nil {
-		return nil, err
+		return classify(err)
 	}
-	defer rows.Close()
-	var entries []ledger.LogEntry
-	for rows.Next() {
-		var entry ledger.LogEntry
-		var appended string
-		if err := rows.Scan(&entry.Seq, &entry.CapsuleID, &appended); err != nil {
-			return nil, err
+	defer func() { err = errors.Join(err, conn.Close()) }()
+	if _, err := conn.ExecContext(ctx, begin); err != nil {
+		return classify(err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, rollbackErr := conn.ExecContext(context.Background(), "ROLLBACK")
+			err = errors.Join(err, rollbackErr)
 		}
-		entry.AppendedAt, err = time.Parse(time.RFC3339Nano, appended)
-		if err != nil {
-			return nil, err
-		}
-		entries = append(entries, entry)
+	}()
+	if err := operation(conn); err != nil {
+		return classify(err)
 	}
-	return entries, rows.Err()
-}
-
-// ScanEntries projects AAC Capsule IDs into application-neutral CLL leaf bytes.
-func (s *Store) ScanEntries(ctx context.Context, after uint64, limit int) ([]cll.Entry, error) {
-	entries, err := s.ScanIDs(ctx, after, limit)
-	if err != nil {
-		return nil, err
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return classify(err)
 	}
-	return ledger.ProjectCLLEntries(entries)
-}
-
-func (s *Store) FindChainGaps(ctx context.Context) ([]ledger.ChainGap, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.closed {
-		return nil, ledger.ErrClosed
-	}
-	rows, err := s.db.QueryContext(ctx, `SELECT c.seq,c.capsule_id,c.parent_id FROM capsules c LEFT JOIN capsules p ON p.log_id=c.log_id AND p.capsule_id=c.parent_id WHERE c.log_id=? AND c.parent_id<>'' AND p.capsule_id IS NULL ORDER BY c.seq`, s.logID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var gaps []ledger.ChainGap
-	for rows.Next() {
-		var gap ledger.ChainGap
-		if err := rows.Scan(&gap.Seq, &gap.CapsuleID, &gap.ParentID); err != nil {
-			return nil, err
-		}
-		gaps = append(gaps, gap)
-	}
-	return gaps, rows.Err()
-}
-
-func (s *Store) LoadCLL(ctx context.Context) (ledger.CLLState, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.closed {
-		return ledger.CLLState{}, ledger.ErrClosed
-	}
-	state := ledger.CLLState{LogID: s.logID}
-	var first string
-	if err := s.db.QueryRowContext(ctx, `SELECT indexed_seq,first_uncheckpointed,force_checkpoint FROM ledger_metadata WHERE log_id=?`, s.logID).Scan(&state.IndexedSeq, &first, &state.ForceCheckpoint); err != nil {
-		return ledger.CLLState{}, err
-	}
-	var err error
-	if first != "" {
-		state.FirstUncheckpointed, err = time.Parse(time.RFC3339Nano, first)
-		if err != nil {
-			return ledger.CLLState{}, err
-		}
-	}
-	rows, err := s.db.QueryContext(ctx, `SELECT position,hash FROM mmr_nodes WHERE log_id=? ORDER BY position`, s.logID)
-	if err != nil {
-		return ledger.CLLState{}, err
-	}
-	for rows.Next() {
-		var node ledger.MMRNode
-		if err := rows.Scan(&node.Position, &node.Hash); err != nil {
-			rows.Close()
-			return ledger.CLLState{}, err
-		}
-		state.Nodes = append(state.Nodes, node)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return ledger.CLLState{}, err
-	}
-	if err := rows.Close(); err != nil {
-		return ledger.CLLState{}, err
-	}
-	rows, err = s.db.QueryContext(ctx, `SELECT indexed_seq,mmr_size,root,payload,signed_checkpoint,created_at FROM checkpoints WHERE log_id=? ORDER BY mmr_size`, s.logID)
-	if err != nil {
-		return ledger.CLLState{}, err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var cp ledger.CheckpointRecord
-		var created string
-		if err := rows.Scan(&cp.IndexedSeq, &cp.MMRSize, &cp.Root, &cp.Payload, &cp.SignedCheckpoint, &created); err != nil {
-			return ledger.CLLState{}, err
-		}
-		cp.CreatedAt, err = time.Parse(time.RFC3339Nano, created)
-		if err != nil {
-			return ledger.CLLState{}, err
-		}
-		state.Checkpoints = append(state.Checkpoints, cp)
-	}
-	return state, rows.Err()
-}
-
-func (s *Store) CommitCLL(ctx context.Context, mutation ledger.CLLMutation) (finalErr error) {
-	defer func() { finalErr = classifySQLite(finalErr) }()
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.closed {
-		return ledger.ErrClosed
-	}
-	mutation = mutation.Normalized()
-	if err := mutation.Validate(); err != nil {
-		return err
-	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
-	var indexed uint64
-	var active bool
-	if err := tx.QueryRowContext(ctx, `SELECT indexed_seq,active FROM ledger_metadata WHERE log_id=?`, s.logID).Scan(&indexed, &active); err != nil {
-		return err
-	}
-	if !active {
-		return ledger.ErrConflict
-	}
-	if indexed != mutation.ExpectedIndexedSeq || mutation.IndexedSeq < indexed {
-		return ledger.ErrConflict
-	}
-	var count uint64
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM mmr_nodes WHERE log_id=?`, s.logID).Scan(&count); err != nil {
-		return err
-	}
-	leaves, complete := mmr.LeafCount(count + uint64(len(mutation.Nodes)))
-	if !complete || leaves != mutation.IndexedSeq {
-		return fmt.Errorf("%w: MMR size does not match indexed sequence", ledger.ErrInvalid)
-	}
-	for index, node := range mutation.Nodes {
-		if node.Position != count+uint64(index) {
-			return ledger.ErrInvalid
-		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO mmr_nodes(log_id,position,hash) VALUES(?,?,?)`, s.logID, node.Position, node.Hash); err != nil {
-			return err
-		}
-	}
-	first := ""
-	if !mutation.FirstUncheckpointed.IsZero() {
-		first = mutation.FirstUncheckpointed.UTC().Format(time.RFC3339Nano)
-	}
-	force := 1
-	if mutation.Checkpoint != nil {
-		force = 0
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE ledger_metadata SET indexed_seq=?,first_uncheckpointed=?,force_checkpoint=CASE WHEN force_checkpoint=1 THEN ? ELSE 0 END WHERE log_id=?`, mutation.IndexedSeq, first, force, s.logID); err != nil {
-		return err
-	}
-	if mutation.Checkpoint != nil {
-		cp := mutation.Checkpoint
-		if cp.MMRSize != count+uint64(len(mutation.Nodes)) {
-			return ledger.ErrInvalid
-		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO checkpoints(log_id,mmr_size,indexed_seq,root,payload,signed_checkpoint,created_at) VALUES(?,?,?,?,?,?,?)`, s.logID, cp.MMRSize, cp.IndexedSeq, cp.Root, cp.Payload, cp.SignedCheckpoint, cp.CreatedAt.UTC().Format(time.RFC3339Nano)); err != nil {
-			return err
-		}
-		for _, id := range mutation.WitnessIDs {
-			if _, err := tx.ExecContext(ctx, `INSERT INTO witness_deliveries(log_id,witness_id,mmr_size,state) VALUES(?,?,?,?)`, s.logID, id, cp.MMRSize, ledger.WitnessPending); err != nil {
-				return err
-			}
-		}
-	}
-	return tx.Commit()
-}
-
-func (s *Store) PendingWitnesses(ctx context.Context, witnessID string, limit int) ([]ledger.PendingWitness, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.closed {
-		return nil, ledger.ErrClosed
-	}
-	if ledger.ValidateIdentifier(witnessID) != nil || limit <= 0 || limit > ledger.MaxScanLimit {
-		return nil, ledger.ErrInvalid
-	}
-	rows, err := s.db.QueryContext(ctx, `SELECT d.state,d.attempts,d.next_attempt_at,d.last_error,c.indexed_seq,c.mmr_size,c.root,c.payload,c.signed_checkpoint,c.created_at FROM witness_deliveries d JOIN checkpoints c ON c.log_id=d.log_id AND c.mmr_size=d.mmr_size WHERE d.log_id=? AND d.witness_id=? AND d.state IN (?,?) AND NOT EXISTS(SELECT 1 FROM witness_deliveries blocked WHERE blocked.log_id=d.log_id AND blocked.witness_id=d.witness_id AND blocked.state=?) ORDER BY d.mmr_size LIMIT ?`, s.logID, witnessID, ledger.WitnessPending, ledger.WitnessRetryable, ledger.WitnessContinuityConflict, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []ledger.PendingWitness
-	for rows.Next() {
-		item := ledger.PendingWitness{WitnessID: witnessID}
-		var next, created string
-		if err := rows.Scan(&item.State, &item.Attempts, &next, &item.LastError, &item.Checkpoint.IndexedSeq, &item.Checkpoint.MMRSize, &item.Checkpoint.Root, &item.Checkpoint.Payload, &item.Checkpoint.SignedCheckpoint, &created); err != nil {
-			return nil, err
-		}
-		if next != "" {
-			item.NextAttemptAt, err = time.Parse(time.RFC3339Nano, next)
-			if err != nil {
-				return nil, err
-			}
-		}
-		item.Checkpoint.CreatedAt, err = time.Parse(time.RFC3339Nano, created)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, item)
-	}
-	return out, rows.Err()
-}
-
-func (s *Store) CommitWitness(ctx context.Context, result ledger.WitnessResult) (finalErr error) {
-	defer func() { finalErr = classifySQLite(finalErr) }()
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.closed {
-		return ledger.ErrClosed
-	}
-	result = result.Normalized()
-	if err := result.Validate(); err != nil {
-		return err
-	}
-	next := ""
-	if !result.NextAttemptAt.IsZero() {
-		next = result.NextAttemptAt.UTC().Format(time.RFC3339Nano)
-	}
-	attempted := ""
-	if !result.AttemptedAt.IsZero() {
-		attempted = result.AttemptedAt.UTC().Format(time.RFC3339Nano)
-	}
-	res, err := s.db.ExecContext(ctx, `UPDATE witness_deliveries SET state=?,attempts=attempts+1,attempted_at=?,next_attempt_at=?,last_error=?,receipt=? WHERE log_id=? AND witness_id=? AND mmr_size=? AND state IN (?,?) AND EXISTS(SELECT 1 FROM ledger_metadata m WHERE m.log_id=? AND m.active=1)`, result.State, attempted, next, result.Error, result.Receipt, s.logID, result.WitnessID, result.MMRSize, ledger.WitnessPending, ledger.WitnessRetryable, s.logID)
-	if err != nil {
-		return err
-	}
-	affected, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if affected != 1 {
-		return s.classifyWitnessUpdate(ctx, result.WitnessID, result.MMRSize)
-	}
+	committed = true
 	return nil
 }
 
-func (s *Store) classifyWitnessUpdate(ctx context.Context, witnessID string, mmrSize uint64) error {
-	var state ledger.WitnessState
-	err := s.db.QueryRowContext(ctx, `SELECT state FROM witness_deliveries WHERE log_id=? AND witness_id=? AND mmr_size=?`, s.logID, witnessID, mmrSize).Scan(&state)
-	if errors.Is(err, sql.ErrNoRows) {
-		return ledger.ErrNotFound
-	}
+func validateEntries(ctx context.Context, q queryer, logID string) (resultErr error) {
+	rows, err := q.QueryContext(ctx, "SELECT seq,length(value),appended_at FROM cll_entries WHERE log_id=? ORDER BY seq", logID)
 	if err != nil {
+		return classify(err)
+	}
+	defer func() { resultErr = errors.Join(resultErr, rows.Close()) }()
+	expected := uint64(1)
+	for rows.Next() {
+		var seq uint64
+		var width int
+		var timestamp string
+		if err := rows.Scan(&seq, &width, &timestamp); err != nil {
+			return err
+		}
+		if seq != expected || seq > cll.MaxPortableInteger || width != cll.EntryBytes {
+			return fmt.Errorf("%w: stored entries are not dense and valid", cll.ErrCorrupt)
+		}
+		if _, err := portable.ParseTime(timestamp); err != nil {
+			return fmt.Errorf("%w: stored entry time is invalid", cll.ErrCorrupt)
+		}
+		expected++
+	}
+	return rows.Err()
+}
+
+func loadState(ctx context.Context, q queryer, logID string) (cll.State, error) {
+	var raw []byte
+	if err := q.QueryRowContext(ctx, "SELECT state FROM cll_meta WHERE log_id=?", logID).Scan(&raw); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return cll.State{}, fmt.Errorf("%w: missing CLL metadata", cll.ErrCorrupt)
+		}
+		return cll.State{}, err
+	}
+	var wire backend.WireState
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		return cll.State{}, fmt.Errorf("%w: decode CLL metadata: %v", cll.ErrCorrupt, err)
+	}
+	wire.Nodes = []string{}
+	rows, err := q.QueryContext(ctx, "SELECT position,node FROM cll_nodes WHERE log_id=? ORDER BY position", logID)
+	if err != nil {
+		return cll.State{}, err
+	}
+	position := uint64(0)
+	for rows.Next() {
+		var storedPosition uint64
+		var node []byte
+		if err := rows.Scan(&storedPosition, &node); err != nil {
+			return cll.State{}, closeRows(rows, err)
+		}
+		if storedPosition != position {
+			return cll.State{}, closeRows(rows, fmt.Errorf("%w: stored node positions are not dense", cll.ErrCorrupt))
+		}
+		wire.Nodes = append(wire.Nodes, base64.StdEncoding.EncodeToString(node))
+		position++
+	}
+	if err := rows.Err(); err != nil {
+		return cll.State{}, closeRows(rows, err)
+	}
+	if err := rows.Close(); err != nil {
+		return cll.State{}, err
+	}
+	wire.Witnesses, err = loadWireWitnesses(ctx, q, logID)
+	if err != nil {
+		return cll.State{}, err
+	}
+	return backend.StateFromWire(wire)
+}
+
+func loadWireWitnesses(ctx context.Context, q queryer, logID string) ([]backend.WireWitness, error) {
+	rows, err := q.QueryContext(ctx, "SELECT witness_id,checkpoint_size,attempts,witness FROM cll_witnesses WHERE log_id=? ORDER BY checkpoint_size,witness_id", logID)
+	if err != nil {
+		return nil, err
+	}
+	witnesses := []backend.WireWitness{}
+	for rows.Next() {
+		var id, size string
+		var attempts uint32
+		var encoded []byte
+		if err := rows.Scan(&id, &size, &attempts, &encoded); err != nil {
+			return nil, closeRows(rows, err)
+		}
+		var witness backend.WireWitness
+		if err := json.Unmarshal(encoded, &witness); err != nil {
+			return nil, closeRows(rows, fmt.Errorf("%w: decode witness row: %v", cll.ErrCorrupt, err))
+		}
+		if witness.WitnessID != id || witness.CheckpointSize != size || witness.Attempts != attempts {
+			return nil, closeRows(rows, fmt.Errorf("%w: witness index disagrees with JSON", cll.ErrCorrupt))
+		}
+		witnesses = append(witnesses, witness)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, closeRows(rows, err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	return witnesses, nil
+}
+
+func closeRows(rows *sql.Rows, cause error) error {
+	return errors.Join(cause, rows.Close())
+}
+
+func (s *Store) Append(ctx context.Context, input cll.AppendInput) (result cll.AppendResult, err error) {
+	err = s.withWrite(ctx, func(conn *sql.Conn) error {
+		if len(input.Value) != cll.EntryBytes || portable.ValidateTime(input.AppendedAt) != nil {
+			return fmt.Errorf("%w: invalid append input", cll.ErrInvalid)
+		}
+		var seq uint64
+		var value []byte
+		var timestamp string
+		err := conn.QueryRowContext(ctx, "SELECT seq,value,appended_at FROM cll_entries WHERE log_id=? AND value=?", s.logID, input.Value).Scan(&seq, &value, &timestamp)
+		if err == nil {
+			entry, err := entryFromRow(seq, value, timestamp)
+			if err != nil {
+				return err
+			}
+			result = cll.AppendResult{Entry: entry, Outcome: cll.AppendIdempotent}
+			return nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		var maximum sql.NullInt64
+		if err := conn.QueryRowContext(ctx, "SELECT MAX(seq) FROM cll_entries WHERE log_id=?", s.logID).Scan(&maximum); err != nil {
+			return err
+		}
+		seq = 1
+		if maximum.Valid {
+			seq = uint64(maximum.Int64) + 1
+		}
+		if seq > cll.MaxPortableInteger {
+			return fmt.Errorf("%w: entry sequence exceeds portable range", cll.ErrInvalid)
+		}
+		timestamp, err = portable.FormatTime(input.AppendedAt)
+		if err != nil {
+			return fmt.Errorf("%w: invalid append time", cll.ErrInvalid)
+		}
+		if _, err := conn.ExecContext(ctx, "INSERT INTO cll_entries(log_id,seq,value,appended_at) VALUES(?,?,?,?)", s.logID, seq, input.Value, timestamp); err != nil {
+			return err
+		}
+		result = cll.AppendResult{Entry: cll.Entry{Seq: seq, Value: append([]byte(nil), input.Value...), AppendedAt: portable.NormalizeTime(input.AppendedAt)}, Outcome: cll.AppendInserted}
+		return nil
+	})
+	return result, err
+}
+
+func entryFromRow(seq uint64, value []byte, timestamp string) (cll.Entry, error) {
+	if seq == 0 || seq > cll.MaxPortableInteger || len(value) != cll.EntryBytes {
+		return cll.Entry{}, fmt.Errorf("%w: stored entry is invalid", cll.ErrCorrupt)
+	}
+	appendedAt, err := portable.ParseTime(timestamp)
+	if err != nil {
+		return cll.Entry{}, fmt.Errorf("%w: stored entry time is invalid", cll.ErrCorrupt)
+	}
+	return cll.Entry{Seq: seq, Value: append([]byte(nil), value...), AppendedAt: appendedAt}, nil
+}
+
+func (s *Store) GetEntry(ctx context.Context, identity []byte) (result cll.Entry, err error) {
+	err = s.withRead(ctx, func(q queryer) error {
+		if len(identity) != cll.EntryBytes {
+			return fmt.Errorf("%w: entry value has wrong width", cll.ErrInvalid)
+		}
+		var seq uint64
+		var value []byte
+		var timestamp string
+		err := q.QueryRowContext(ctx, "SELECT seq,value,appended_at FROM cll_entries WHERE log_id=? AND value=?", s.logID, identity).Scan(&seq, &value, &timestamp)
+		if errors.Is(err, sql.ErrNoRows) {
+			return cll.ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		result, err = entryFromRow(seq, value, timestamp)
 		return err
-	}
-	return ledger.ErrConflict
+	})
+	return result, err
 }
 
-func (s *Store) GetWitness(ctx context.Context, witnessID string, mmrSize uint64) (ledger.PendingWitness, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+func (s *Store) ScanEntries(ctx context.Context, afterSeq uint64, limit int) (result []cll.Entry, err error) {
+	err = s.withRead(ctx, func(q queryer) (scanErr error) {
+		if afterSeq > cll.MaxPortableInteger || limit < 1 || limit > cll.MaxScanLimit {
+			return fmt.Errorf("%w: invalid entry scan", cll.ErrInvalid)
+		}
+		rows, err := q.QueryContext(ctx, "SELECT seq,value,appended_at FROM cll_entries WHERE log_id=? AND seq>? ORDER BY seq LIMIT ?", s.logID, afterSeq, limit)
+		if err != nil {
+			return err
+		}
+		defer func() { scanErr = errors.Join(scanErr, rows.Close()) }()
+		for rows.Next() {
+			var seq uint64
+			var value []byte
+			var timestamp string
+			if err := rows.Scan(&seq, &value, &timestamp); err != nil {
+				return err
+			}
+			entry, err := entryFromRow(seq, value, timestamp)
+			if err != nil {
+				return err
+			}
+			result = append(result, entry)
+		}
+		return rows.Err()
+	})
+	return result, err
+}
+
+func (s *Store) LoadCLL(ctx context.Context) (result cll.State, err error) {
+	err = s.withRead(ctx, func(q queryer) error {
+		result, err = loadState(ctx, q, s.logID)
+		return err
+	})
+	return result, err
+}
+
+func (s *Store) CommitCLL(ctx context.Context, expectedSize uint64, expectedCheckpoint []byte, next cll.State) error {
+	return s.withWrite(ctx, func(conn *sql.Conn) error {
+		current, err := loadState(ctx, conn, s.logID)
+		if err != nil {
+			return err
+		}
+		updated, err := backend.ApplyCLL(current, expectedSize, expectedCheckpoint, next)
+		if err != nil {
+			return err
+		}
+		metadata, err := backend.MarshalMetadata(updated)
+		if err != nil {
+			return err
+		}
+		if _, err := conn.ExecContext(ctx, "UPDATE cll_meta SET state=? WHERE log_id=?", metadata, s.logID); err != nil {
+			return err
+		}
+		for position := len(current.Nodes); position < len(updated.Nodes); position++ {
+			if _, err := conn.ExecContext(ctx, "INSERT INTO cll_nodes(log_id,position,node) VALUES(?,?,?)", s.logID, position, updated.Nodes[position]); err != nil {
+				return err
+			}
+		}
+		existing := make(map[string]struct{}, len(current.Witnesses))
+		for _, witness := range current.Witnesses {
+			existing[backend.WitnessKey(witness.WitnessID, witness.CheckpointSize)] = struct{}{}
+		}
+		for _, witness := range updated.Witnesses {
+			if _, found := existing[backend.WitnessKey(witness.WitnessID, witness.CheckpointSize)]; found {
+				continue
+			}
+			encoded, err := backend.MarshalWitness(witness)
+			if err != nil {
+				return err
+			}
+			if _, err := conn.ExecContext(ctx, "INSERT INTO cll_witnesses(log_id,witness_id,checkpoint_size,attempts,witness) VALUES(?,?,?,?,?)", s.logID, witness.WitnessID, fmt.Sprintf("%d", witness.CheckpointSize), witness.Attempts, encoded); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func (s *Store) PendingWitnesses(ctx context.Context, now time.Time, limit int) (result []cll.WitnessState, err error) {
+	err = s.withRead(ctx, func(q queryer) error {
+		witnesses, err := loadWireWitnesses(ctx, q, s.logID)
+		if err != nil {
+			return err
+		}
+		state, err := backend.StateFromWire(backend.WireState{Size: "0", IndexedSeq: "0", Nodes: []string{}, Witnesses: witnesses})
+		if err != nil {
+			return err
+		}
+		engine := backend.New()
+		if err := engine.Replace(nil, state); err != nil {
+			return err
+		}
+		result, err = engine.PendingWitnesses(now, limit)
+		return err
+	})
+	return result, err
+}
+
+func (s *Store) GetWitness(ctx context.Context, witnessID string, checkpointSize uint64) (result cll.WitnessState, err error) {
+	err = s.withRead(ctx, func(q queryer) error {
+		if cll.ValidateIdentifier(witnessID) != nil || checkpointSize == 0 {
+			return fmt.Errorf("%w: invalid witness key", cll.ErrInvalid)
+		}
+		var attempts uint32
+		var encoded []byte
+		err := q.QueryRowContext(ctx, "SELECT attempts,witness FROM cll_witnesses WHERE log_id=? AND witness_id=? AND checkpoint_size=?", s.logID, witnessID, fmt.Sprintf("%d", checkpointSize)).Scan(&attempts, &encoded)
+		if errors.Is(err, sql.ErrNoRows) {
+			return cll.ErrNotFound
+		}
+		if err != nil {
+			return err
+		}
+		result, err = backend.UnmarshalWitness(encoded)
+		if err == nil && (result.Attempts != attempts || result.WitnessID != witnessID || result.CheckpointSize != checkpointSize) {
+			return fmt.Errorf("%w: witness index disagrees with JSON", cll.ErrCorrupt)
+		}
+		return err
+	})
+	return result, err
+}
+
+func (s *Store) CommitWitness(ctx context.Context, expectedAttempts uint32, next cll.WitnessState) error {
+	return s.withWrite(ctx, func(conn *sql.Conn) error {
+		var encodedCurrent []byte
+		err := conn.QueryRowContext(ctx, "SELECT witness FROM cll_witnesses WHERE log_id=? AND witness_id=? AND checkpoint_size=?", s.logID, next.WitnessID, fmt.Sprintf("%d", next.CheckpointSize)).Scan(&encodedCurrent)
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: witness state changed", cll.ErrContention)
+		}
+		if err != nil {
+			return err
+		}
+		current, err := backend.UnmarshalWitness(encodedCurrent)
+		if err != nil {
+			return err
+		}
+		updated, err := backend.ApplyWitness(cll.State{Witnesses: []cll.WitnessState{current}}, expectedAttempts, next)
+		if err != nil {
+			return err
+		}
+		encoded, err := backend.MarshalWitness(updated.Witnesses[0])
+		if err != nil {
+			return err
+		}
+		result, err := conn.ExecContext(ctx, "UPDATE cll_witnesses SET attempts=?,witness=? WHERE log_id=? AND witness_id=? AND checkpoint_size=? AND attempts=?", next.Attempts, encoded, s.logID, next.WitnessID, fmt.Sprintf("%d", next.CheckpointSize), expectedAttempts)
+		if err != nil {
+			return err
+		}
+		changed, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if changed != 1 {
+			return fmt.Errorf("%w: witness CAS failed", cll.ErrContention)
+		}
+		return nil
+	})
+}
+
+// Close is idempotent and waits for in-process operations on this handle.
+func (s *Store) Close() error {
+	s.lifecycle.Lock()
+	defer s.lifecycle.Unlock()
 	if s.closed {
-		return ledger.PendingWitness{}, ledger.ErrClosed
+		return nil
 	}
-	if ledger.ValidateIdentifier(witnessID) != nil || mmrSize == 0 {
-		return ledger.PendingWitness{}, ledger.ErrInvalid
-	}
-	item := ledger.PendingWitness{WitnessID: witnessID}
-	var attempted, next, created string
-	err := s.db.QueryRowContext(ctx, `SELECT d.state,d.attempts,d.attempted_at,d.next_attempt_at,d.last_error,d.receipt,c.indexed_seq,c.mmr_size,c.root,c.payload,c.signed_checkpoint,c.created_at FROM witness_deliveries d JOIN checkpoints c ON c.log_id=d.log_id AND c.mmr_size=d.mmr_size WHERE d.log_id=? AND d.witness_id=? AND d.mmr_size=?`, s.logID, witnessID, mmrSize).Scan(&item.State, &item.Attempts, &attempted, &next, &item.LastError, &item.Receipt, &item.Checkpoint.IndexedSeq, &item.Checkpoint.MMRSize, &item.Checkpoint.Root, &item.Checkpoint.Payload, &item.Checkpoint.SignedCheckpoint, &created)
-	if errors.Is(err, sql.ErrNoRows) {
-		return ledger.PendingWitness{}, ledger.ErrNotFound
-	}
-	if err != nil {
-		return ledger.PendingWitness{}, err
-	}
-	if attempted != "" {
-		item.LastAttemptAt, err = time.Parse(time.RFC3339Nano, attempted)
-		if err != nil {
-			return ledger.PendingWitness{}, err
-		}
-	}
-	if next != "" {
-		item.NextAttemptAt, err = time.Parse(time.RFC3339Nano, next)
-		if err != nil {
-			return ledger.PendingWitness{}, err
-		}
-	}
-	item.Checkpoint.CreatedAt, err = time.Parse(time.RFC3339Nano, created)
-	return item, err
+	s.shared.mu.Lock()
+	err := s.db.Close()
+	s.shared.mu.Unlock()
+	s.closed = true
+	releaseShared(s.lockKey)
+	return err
 }
 
-func classifySQLite(err error) error {
+func classify(err error) error {
 	if err == nil {
 		return nil
 	}
-	var sqliteErr *sqliteDriver.Error
+	var sqliteErr *modernsqlite.Error
 	if errors.As(err, &sqliteErr) {
-		switch sqliteErr.Code() & 0xff {
-		case 5, 6:
-			return fmt.Errorf("%w: SQLite error %d", ledger.ErrRetryable, sqliteErr.Code())
+		code := sqliteErr.Code() & 0xff
+		if code == 5 || code == 6 {
+			return fmt.Errorf("%w: %v", cll.ErrContention, err)
 		}
-	}
-	if bytes.Contains([]byte(err.Error()), []byte("UNIQUE constraint failed")) {
-		return ledger.ErrConflict
 	}
 	return err
 }
 
-func ensureActive(ctx context.Context, tx *sql.Tx, logID string) error {
-	var active bool
-	if err := tx.QueryRowContext(ctx, `SELECT active FROM ledger_metadata WHERE log_id=?`, logID).Scan(&active); err != nil {
-		return err
-	}
-	if !active {
-		return ledger.ErrConflict
-	}
-	return nil
-}
-
-func (s *Store) Close() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return nil
-	}
-	s.closed = true
-	return s.db.Close()
-}
-
-func (s *Store) Rebaseline(ctx context.Context, input ledger.RebaselineInput) (_ ledger.RebaselineRecord, finalErr error) {
-	defer func() { finalErr = classifySQLite(finalErr) }()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return ledger.RebaselineRecord{}, ledger.ErrClosed
-	}
-	input = input.Normalized()
-	if input.Validate() != nil || input.NewLogID == s.logID {
-		return ledger.RebaselineRecord{}, ledger.ErrInvalid
-	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return ledger.RebaselineRecord{}, err
-	}
-	defer func() { _ = tx.Rollback() }()
-	var exists int
-	err = tx.QueryRowContext(ctx, `SELECT 1 FROM ledger_metadata WHERE log_id=?`, input.NewLogID).Scan(&exists)
-	if err == nil {
-		return ledger.RebaselineRecord{}, ledger.ErrInvalid
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return ledger.RebaselineRecord{}, err
-	}
-	var next, indexed uint64
-	var first string
-	var active bool
-	if err := tx.QueryRowContext(ctx, `SELECT next_seq,indexed_seq,first_uncheckpointed,active FROM ledger_metadata WHERE log_id=?`, s.logID).Scan(&next, &indexed, &first, &active); err != nil {
-		return ledger.RebaselineRecord{}, err
-	}
-	if !active {
-		return ledger.RebaselineRecord{}, ledger.ErrConflict
-	}
-	var conflicts int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM witness_deliveries WHERE log_id=? AND state=?`, s.logID, ledger.WitnessContinuityConflict).Scan(&conflicts); err != nil {
-		return ledger.RebaselineRecord{}, err
-	}
-	if conflicts == 0 {
-		return ledger.RebaselineRecord{}, fmt.Errorf("%w: rebaseline requires a continuity conflict", ledger.ErrInvalid)
-	}
-	record := ledger.RebaselineRecord{OldLogID: s.logID, NewLogID: input.NewLogID, Reason: input.Reason, At: input.At.UTC(), MigrationID: input.MigrationID}
-	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(mmr_size),0) FROM witness_deliveries WHERE log_id=? AND state=?`, s.logID, ledger.WitnessVerified).Scan(&record.LastWitnessedSize); err != nil {
-		return ledger.RebaselineRecord{}, err
-	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO ledger_metadata(log_id,next_seq,indexed_seq,first_uncheckpointed,active,force_checkpoint) VALUES(?,?,?,?,1,1)`, input.NewLogID, next, indexed, first); err != nil {
-		return ledger.RebaselineRecord{}, err
-	}
-	for _, statement := range []string{`INSERT INTO capsules(log_id,seq,capsule_id,capsule,authenticity,verification,parent_id,appended_at) SELECT ?,seq,capsule_id,capsule,authenticity,verification,parent_id,appended_at FROM capsules WHERE log_id=?`, `INSERT INTO envelopes SELECT ?,capsule_id,digest,envelope,verification,added_at FROM envelopes WHERE log_id=?`, `INSERT INTO mmr_nodes SELECT ?,position,hash FROM mmr_nodes WHERE log_id=?`} {
-		if _, err := tx.ExecContext(ctx, statement, input.NewLogID, s.logID); err != nil {
-			return ledger.RebaselineRecord{}, err
-		}
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE ledger_metadata SET active=0 WHERE log_id=?`, s.logID); err != nil {
-		return ledger.RebaselineRecord{}, err
-	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO rebaselines(migration_id,old_log_id,new_log_id,reason,migrated_at,last_witnessed_size) VALUES(?,?,?,?,?,?)`, record.MigrationID, record.OldLogID, record.NewLogID, record.Reason, record.At.Format(time.RFC3339Nano), record.LastWitnessedSize); err != nil {
-		return ledger.RebaselineRecord{}, err
-	}
-	if err := tx.Commit(); err != nil {
-		return ledger.RebaselineRecord{}, err
-	}
-	s.logID = input.NewLogID
-	return record, nil
-}
-
-// Rebaselines returns the active log's durable migration lineage.
-func (s *Store) Rebaselines(ctx context.Context, limit int) ([]ledger.RebaselineRecord, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.closed {
-		return nil, ledger.ErrClosed
-	}
-	if limit <= 0 || limit > ledger.MaxScanLimit {
-		return nil, ledger.ErrInvalid
-	}
-	current := s.logID
-	history := make([]ledger.RebaselineRecord, 0, limit)
-	seen := make(map[string]struct{}, limit)
-	for len(history) < limit {
-		if _, exists := seen[current]; exists {
-			return nil, fmt.Errorf("%w: cyclic rebaseline lineage", ledger.ErrCorrupt)
-		}
-		seen[current] = struct{}{}
-		var record ledger.RebaselineRecord
-		var at string
-		err := s.db.QueryRowContext(ctx, `SELECT old_log_id,new_log_id,reason,migrated_at,migration_id,last_witnessed_size FROM rebaselines WHERE new_log_id=?`, current).
-			Scan(&record.OldLogID, &record.NewLogID, &record.Reason, &at, &record.MigrationID, &record.LastWitnessedSize)
-		if errors.Is(err, sql.ErrNoRows) {
-			break
-		}
-		if err != nil {
-			return nil, err
-		}
-		record.At, err = time.Parse(time.RFC3339Nano, at)
-		if err != nil {
-			return nil, fmt.Errorf("%w: invalid rebaseline timestamp", ledger.ErrCorrupt)
-		}
-		var witnessed uint64
-		if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(mmr_size),0) FROM witness_deliveries WHERE log_id=? AND state=?`, record.OldLogID, ledger.WitnessVerified).Scan(&witnessed); err != nil {
-			return nil, err
-		}
-		if witnessed != record.LastWitnessedSize {
-			return nil, fmt.Errorf("%w: rebaseline witnessed size mismatch", ledger.ErrCorrupt)
-		}
-		history = append(history, record)
-		current = record.OldLogID
-	}
-	slices.Reverse(history)
-	return history, nil
-}
-
-func sameEnvelopes(left, right []ledger.Envelope) bool {
-	if len(right) > len(left) {
-		return false
-	}
-	values := make(map[ledger.EnvelopeDigest][]byte, len(left))
-	for _, e := range left {
-		values[e.Digest] = e.Bytes
-	}
-	for _, e := range right {
-		stored, exists := values[e.Digest]
-		if !exists || !bytes.Equal(stored, e.Bytes) {
-			return false
-		}
-	}
-	return true
-}
-func clone(input []byte) []byte { return append([]byte(nil), input...) }
-func cloneEnvelope(e ledger.Envelope) ledger.Envelope {
-	e.AddedAt = ledger.NormalizeTime(e.AddedAt)
-	return e.Clone()
-}
-func cloneEnvelopes(in []ledger.Envelope) []ledger.Envelope {
-	if len(in) == 0 {
-		return nil
-	}
-	out := make([]ledger.Envelope, len(in))
-	for i := range in {
-		out[i] = cloneEnvelope(in[i])
-	}
-	return out
-}
+var _ cll.Backend = (*Store)(nil)

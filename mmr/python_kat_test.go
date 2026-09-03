@@ -25,7 +25,7 @@ func TestPythonSevenLeafRootKAT(t *testing.T) {
 	require.NoError(t, err)
 	for number, want := range expected {
 		bodyDigest := sha256.Sum256([]byte(fmt.Sprintf("asg-ledger-mmr-vector-leaf-%d", number+1)))
-		_, err := tree.AppendCapsuleID(hex.EncodeToString(bodyDigest[:]))
+		_, err := tree.AppendHexIdentity(hex.EncodeToString(bodyDigest[:]))
 		require.NoError(t, err)
 		root, err := tree.Root()
 		require.NoError(t, err)

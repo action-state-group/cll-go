@@ -1,6 +1,7 @@
 package checkpoint
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"errors"
@@ -9,7 +10,7 @@ import (
 	"time"
 
 	"github.com/action-state-group/cll-go/cll"
-	"github.com/action-state-group/cll-go/ledger"
+	"github.com/action-state-group/cll-go/internal/portable"
 	"github.com/action-state-group/cll-go/mmr"
 )
 
@@ -31,49 +32,43 @@ type RunnerConfig struct {
 
 // DefaultRunnerConfig returns the interoperable initial cadence.
 func DefaultRunnerConfig(logID string) RunnerConfig {
-	return RunnerConfig{LogID: logID, Cadence: DefaultConfig(), ScanLimit: ledger.DefaultScanLimit, PollInterval: time.Minute}
+	return RunnerConfig{LogID: logID, Cadence: DefaultConfig(), ScanLimit: cll.DefaultScanLimit, PollInterval: time.Minute}
 }
 
-// Runner advances the durable CLL when explicitly run by the host.
+// Runner advances durable CLL state when explicitly run by its host.
 type Runner struct {
 	mu     sync.Mutex
 	config RunnerConfig
-	store  Store
+	store  cll.CheckpointStore
 	signer Signer
 	notify chan struct{}
 }
 
-// Store is the application-neutral entry source plus durable checkpoint state
-// needed by Runner. AAC ledger stores are one implementation.
-type Store interface {
-	cll.Source
-	ledger.CLLStore
-}
-
 // NewRunner validates dependencies without starting background work.
-func NewRunner(config RunnerConfig, store Store, signer Signer) (*Runner, error) {
-	if ledger.ValidateIdentifier(config.LogID) != nil || store == nil || signer == nil || config.ScanLimit <= 0 || config.ScanLimit > ledger.MaxScanLimit || config.PollInterval <= 0 {
-		return nil, fmt.Errorf("%w: invalid runner configuration", ledger.ErrInvalid)
+func NewRunner(config RunnerConfig, store cll.CheckpointStore, signer Signer) (*Runner, error) {
+	if cll.ValidateIdentifier(config.LogID) != nil || store == nil || signer == nil || config.ScanLimit < 1 || config.ScanLimit > cll.MaxScanLimit || config.PollInterval <= 0 {
+		return nil, fmt.Errorf("%w: invalid runner configuration", cll.ErrInvalid)
 	}
 	if err := config.Cadence.Validate(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %v", cll.ErrInvalid, err)
+	}
+	if len(config.WitnessIDs) > cll.MaxWitnesses {
+		return nil, fmt.Errorf("%w: too many witnesses", cll.ErrInvalid)
 	}
 	seen := make(map[string]struct{}, len(config.WitnessIDs))
-	if len(config.WitnessIDs) > ledger.MaxWitnesses {
-		return nil, fmt.Errorf("%w: too many witnesses", ledger.ErrInvalid)
-	}
 	for _, id := range config.WitnessIDs {
-		if err := ledger.ValidateIdentifier(id); err != nil {
-			return nil, fmt.Errorf("%w: invalid witness id", err)
+		if err := cll.ValidateIdentifier(id); err != nil {
+			return nil, fmt.Errorf("%w: invalid witness ID", cll.ErrInvalid)
 		}
 		if _, exists := seen[id]; exists {
-			return nil, fmt.Errorf("%w: duplicate witness id", ledger.ErrInvalid)
+			return nil, fmt.Errorf("%w: duplicate witness ID", cll.ErrInvalid)
 		}
 		seen[id] = struct{}{}
 	}
 	return &Runner{config: config, store: store, signer: signer, notify: make(chan struct{}, 1)}, nil
 }
 
+// Notify wakes a running host loop without blocking the caller.
 func (r *Runner) Notify() {
 	select {
 	case r.notify <- struct{}{}:
@@ -81,11 +76,12 @@ func (r *Runner) Notify() {
 	}
 }
 
+// Run catches up until canceled. Contention is retried on the next wakeup.
 func (r *Runner) Run(ctx context.Context) error {
 	ticker := time.NewTicker(r.config.PollInterval)
 	defer ticker.Stop()
 	for {
-		if err := r.catchUp(ctx, time.Now().UTC()); err != nil && !errors.Is(err, ledger.ErrRetryable) {
+		if err := r.catchUp(ctx, time.Now().UTC()); err != nil && !errors.Is(err, cll.ErrContention) {
 			return err
 		}
 		select {
@@ -97,173 +93,220 @@ func (r *Runner) Run(ctx context.Context) error {
 	}
 }
 
-// RunOnce advances durable CLL state by at most one scan batch. Its boolean is
-// true for any committed progress, whether or not that progress included a
-// checkpoint.
+type runnerState struct {
+	state    cll.State
+	tree     *mmr.Tree
+	previous Record
+}
+
+// RunOnce advances durable state by at most one entry scan batch. It returns
+// true when it commits nodes, a checkpoint, or both.
 func (r *Runner) RunOnce(ctx context.Context, now time.Time) (bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	now = ledger.NormalizeTime(now)
+	var err error
+	now, err = normalizeRunnerTime(now)
+	if err != nil {
+		return false, err
+	}
+	current, err := r.loadRunnerState(ctx)
+	if err != nil {
+		return false, err
+	}
+	return r.advanceOnce(ctx, now, current)
+}
+
+func normalizeRunnerTime(now time.Time) (time.Time, error) {
+	now = portable.NormalizeTime(now)
+	if portable.ValidateTime(now) != nil {
+		return time.Time{}, fmt.Errorf("%w: invalid runner time", cll.ErrInvalid)
+	}
+	return now, nil
+}
+
+func (r *Runner) loadRunnerState(ctx context.Context) (*runnerState, error) {
 	state, err := r.store.LoadCLL(ctx)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
-	if state.LogID != r.config.LogID {
-		if !state.ForceCheckpoint {
-			return false, fmt.Errorf("%w: store log id mismatch", ledger.ErrInvalid)
-		}
-		// Rebaseline atomically changes the live store binding and sets the force
-		// marker. Following it here lets the explicitly running host lifecycle
-		// continue without replacing the runner in a second, racy operation.
-		r.config.LogID = state.LogID
-	}
-	nodes := make([][]byte, len(state.Nodes))
-	for index, node := range state.Nodes {
-		if node.Position != uint64(index) {
-			return false, fmt.Errorf("%w: non-contiguous MMR nodes", ledger.ErrCorrupt)
-		}
-		nodes[index] = node.Hash
-	}
-	tree, err := mmr.New(nodes)
+	tree, err := mmr.New(state.Nodes)
 	if err != nil {
-		return false, fmt.Errorf("restore MMR: %w", err)
+		return nil, fmt.Errorf("%w: restore MMR: %v", cll.ErrCorrupt, err)
 	}
 	leaves, ok := mmr.LeafCount(tree.Size())
-	if !ok || leaves != state.IndexedSeq {
-		return false, fmt.Errorf("%w: MMR size does not match indexed sequence", ledger.ErrCorrupt)
+	if !ok || leaves != state.IndexedSeq || state.Size != tree.Size() {
+		return nil, fmt.Errorf("%w: MMR size does not match indexed sequence", cll.ErrCorrupt)
 	}
-	if err := r.verifyCheckpoints(state, nodes); err != nil {
-		return false, err
+	previous, err := r.verifyCheckpoint(state, tree)
+	if err != nil {
+		return nil, err
 	}
+	return &runnerState{state: state, tree: tree, previous: previous}, nil
+}
+
+func (r *Runner) advanceOnce(ctx context.Context, now time.Time, current *runnerState) (bool, error) {
+	state := current.state
+	tree := current.tree
+	previous := current.previous
 	entries, err := r.store.ScanEntries(ctx, state.IndexedSeq, r.config.ScanLimit)
 	if err != nil {
 		return false, err
 	}
-	firstUncheckpointed := state.FirstUncheckpointed
-	if firstUncheckpointed.IsZero() && len(entries) > 0 {
-		firstUncheckpointed = entries[0].AppendedAt
+	var firstPending *time.Time
+	if state.FirstPendingAt != nil {
+		timestamp := *state.FirstPendingAt
+		firstPending = &timestamp
 	}
-	before := tree.Size()
 	indexed := state.IndexedSeq
 	for _, entry := range entries {
-		if entry.Seq != indexed+1 {
-			return false, fmt.Errorf("%w: non-contiguous CLL projection", ledger.ErrCorrupt)
-		}
-		if entry.AppendedAt.IsZero() {
-			return false, fmt.Errorf("%w: CLL entry append time is zero", ledger.ErrCorrupt)
+		if entry.Seq != indexed+1 || portable.ValidateTime(entry.AppendedAt) != nil {
+			return false, fmt.Errorf("%w: CLL entry sequence or time is invalid", cll.ErrCorrupt)
 		}
 		if _, err := tree.Append(entry.Value); err != nil {
-			return false, err
+			return false, fmt.Errorf("%w: append MMR entry: %v", cll.ErrCorrupt, err)
 		}
 		indexed = entry.Seq
+		if firstPending == nil {
+			timestamp := portable.NormalizeTime(entry.AppendedAt)
+			firstPending = &timestamp
+		}
 	}
-	allNodes := tree.Nodes()
-	newNodes := make([]ledger.MMRNode, 0, uint64(len(allNodes))-before)
-	for position := before; position < uint64(len(allNodes)); position++ {
-		newNodes = append(newNodes, ledger.MMRNode{Position: position, Hash: allNodes[position]})
+	lastCheckpointed := uint64(0)
+	if state.Checkpoint != nil {
+		lastCheckpointed = state.Checkpoint.IndexedSeq
 	}
-	lastSeq := uint64(0)
-	var previous *ledger.CheckpointRecord
-	if len(state.Checkpoints) > 0 {
-		previous = &state.Checkpoints[len(state.Checkpoints)-1]
-		lastSeq = previous.IndexedSeq
-	}
-	uncheckpointed := indexed - lastSeq
-	var cp *ledger.CheckpointRecord
-	if tree.Size() > 0 && (state.ForceCheckpoint || r.config.Cadence.Due(uncheckpointed, firstUncheckpointed, now)) {
+	uncheckpointed := indexed - lastCheckpointed
+	due := firstPending != nil && r.config.Cadence.Due(uncheckpointed, *firstPending, now)
+	next := cll.State{Size: tree.Size(), Nodes: tree.Nodes(), IndexedSeq: indexed, FirstPendingAt: firstPending, Checkpoint: state.Checkpoint, Witnesses: state.Witnesses}
+	if due {
 		root, err := tree.Root()
 		if err != nil {
 			return false, err
 		}
-		payload := Payload{LogID: state.LogID, KeyID: r.signer.KeyID(), MMRSize: tree.Size(), Root: hex.EncodeToString(root), Timestamp: now.UTC()}
-		if previous != nil {
-			payload.PrevSize = previous.MMRSize
-			payload.PrevRoot = previous.Root
-		}
-		body, err := payload.CanonicalJSON()
-		if err != nil {
-			return false, err
-		}
-		newPeaks, err := tree.PeakHashesAt(tree.Size())
-		if err != nil {
-			return false, err
-		}
-		var prevPeaks [][]byte
+		payload := Payload{LogID: r.config.LogID, KeyID: r.signer.KeyID(), MMRSize: tree.Size(), Root: hex.EncodeToString(root), Timestamp: now}
+		var previousPeaks [][]byte
 		var proof *mmr.ConsistencyProof
-		if previous != nil {
-			prevPeaks, err = tree.PeakHashesAt(previous.MMRSize)
-			if err != nil {
-				return false, err
-			}
-			consistency, err := tree.ConsistencyProof(previous.MMRSize)
+		if state.Checkpoint != nil {
+			payload.PrevSize = state.Checkpoint.Size
+			payload.PrevRoot = previous.Root
+			previousPeaks = state.Checkpoint.Peaks
+			consistency, err := tree.ConsistencyProof(state.Checkpoint.Size)
 			if err != nil {
 				return false, err
 			}
 			proof = &consistency
 		}
-		statement, err := r.signer.SignCheckpoint(ctx, body, newPeaks, prevPeaks, proof)
+		body, err := payload.CanonicalJSON()
 		if err != nil {
 			return false, err
 		}
-		cp = &ledger.CheckpointRecord{IndexedSeq: indexed, MMRSize: tree.Size(), Root: payload.Root, Payload: body, SignedCheckpoint: statement, CreatedAt: now.UTC()}
-		firstUncheckpointed = time.Time{}
+		peaks, err := tree.PeakHashesAt(tree.Size())
+		if err != nil {
+			return false, err
+		}
+		statement, err := r.signer.SignCheckpoint(ctx, body, peaks, previousPeaks, proof)
+		if err != nil {
+			return false, err
+		}
+		next.Checkpoint = &cll.CheckpointState{Bytes: statement, Size: tree.Size(), IndexedSeq: indexed, Peaks: peaks}
+		next.FirstPendingAt = nil
+		previous = Record{Root: payload.Root}
+		for _, witnessID := range r.config.WitnessIDs {
+			next.Witnesses = append(next.Witnesses, cll.WitnessState{WitnessID: witnessID, CheckpointSize: tree.Size(), Checkpoint: append([]byte(nil), statement...), NextAttemptAt: now})
+		}
 	}
-	if len(entries) == 0 && cp == nil {
+	if len(entries) == 0 && !due {
 		return false, nil
 	}
-	mutation := ledger.CLLMutation{ExpectedIndexedSeq: state.IndexedSeq, IndexedSeq: indexed, Nodes: newNodes, FirstUncheckpointed: firstUncheckpointed, Checkpoint: cp}
-	if cp != nil {
-		mutation.WitnessIDs = r.config.WitnessIDs
+	var expected []byte
+	if state.Checkpoint != nil {
+		expected = state.Checkpoint.Bytes
 	}
-	if err := r.store.CommitCLL(ctx, mutation); err != nil {
+	if err := r.store.CommitCLL(ctx, state.Size, expected, next); err != nil {
 		return false, err
 	}
+	current.state = next
+	current.previous = previous
 	return true, nil
 }
 
-func (r *Runner) verifyCheckpoints(state ledger.CLLState, nodes [][]byte) error {
-	var previous *ledger.CheckpointRecord
-	for index := range state.Checkpoints {
-		checkpoint := &state.Checkpoints[index]
-		leaves, ok := mmr.LeafCount(checkpoint.MMRSize)
-		if !ok || checkpoint.MMRSize > uint64(len(nodes)) || leaves != checkpoint.IndexedSeq || checkpoint.IndexedSeq > state.IndexedSeq {
-			return fmt.Errorf("%w: invalid stored checkpoint position", ledger.ErrCorrupt)
-		}
-		historical, err := mmr.New(nodes[:checkpoint.MMRSize])
-		if err != nil {
-			return fmt.Errorf("%w: restore checkpoint MMR: %v", ledger.ErrCorrupt, err)
-		}
-		root, err := historical.Root()
-		if err != nil || hex.EncodeToString(root) != checkpoint.Root {
-			return fmt.Errorf("%w: checkpoint root mismatch", ledger.ErrCorrupt)
-		}
-		payload, err := ParsePayload(checkpoint.Payload)
-		if err != nil || payload.LogID != state.LogID || payload.KeyID != r.signer.KeyID() || payload.MMRSize != checkpoint.MMRSize || payload.Root != checkpoint.Root || !ledger.NormalizeTime(payload.Timestamp).Equal(ledger.NormalizeTime(checkpoint.CreatedAt)) {
-			return fmt.Errorf("%w: checkpoint payload mismatch", ledger.ErrCorrupt)
-		}
-		if previous == nil {
-			if payload.PrevSize != 0 || payload.PrevRoot != "" {
-				return fmt.Errorf("%w: first checkpoint has a predecessor", ledger.ErrCorrupt)
-			}
-		} else if payload.PrevSize != previous.MMRSize || payload.PrevRoot != previous.Root {
-			return fmt.Errorf("%w: checkpoint predecessor mismatch", ledger.ErrCorrupt)
-		}
-		if err := r.signer.VerifyCheckpoint(checkpoint.Payload, checkpoint.SignedCheckpoint); err != nil {
-			return fmt.Errorf("%w: stored checkpoint signature: %v", ledger.ErrCorrupt, err)
-		}
-		previous = checkpoint
+func (r *Runner) verifyCheckpoint(state cll.State, tree *mmr.Tree) (Record, error) {
+	if state.Checkpoint == nil {
+		return Record{}, nil
 	}
-	return nil
+	checkpoint := state.Checkpoint
+	leaves, ok := mmr.LeafCount(checkpoint.Size)
+	if !ok || checkpoint.Size > state.Size || leaves != checkpoint.IndexedSeq || checkpoint.IndexedSeq > state.IndexedSeq {
+		return Record{}, fmt.Errorf("%w: invalid stored checkpoint position", cll.ErrCorrupt)
+	}
+	expectedPeaks, err := tree.PeakHashesAt(checkpoint.Size)
+	if err != nil || !samePeaks(expectedPeaks, checkpoint.Peaks) {
+		return Record{}, fmt.Errorf("%w: stored checkpoint peaks mismatch", cll.ErrCorrupt)
+	}
+	record, err := ParseRecord(checkpoint.Bytes)
+	if err != nil || record.LogID != r.config.LogID || record.KeyID != r.signer.KeyID() || record.MMRSize != checkpoint.Size || !samePeaks(record.NewPeaks, checkpoint.Peaks) {
+		return Record{}, fmt.Errorf("%w: stored checkpoint metadata mismatch", cll.ErrCorrupt)
+	}
+	root, err := treeRootAt(tree, checkpoint.Size)
+	if err != nil || !bytes.Equal(root, mmr.RootFromPeaks(checkpoint.Peaks)) || record.Root != hex.EncodeToString(root) {
+		return Record{}, fmt.Errorf("%w: stored checkpoint root mismatch", cll.ErrCorrupt)
+	}
+	payload, err := record.Payload().CanonicalJSON()
+	if err != nil || r.signer.VerifyCheckpoint(payload, checkpoint.Bytes) != nil {
+		return Record{}, fmt.Errorf("%w: stored checkpoint signature mismatch", cll.ErrCorrupt)
+	}
+	return record, nil
+}
+
+func treeRootAt(tree *mmr.Tree, size uint64) ([]byte, error) {
+	peaks, err := tree.PeakHashesAt(size)
+	if err != nil {
+		return nil, err
+	}
+	return mmr.RootFromPeaks(peaks), nil
+}
+
+func samePeaks(left, right [][]byte) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if !bytes.Equal(left[index], right[index]) {
+			return false
+		}
+	}
+	return true
 }
 
 func (r *Runner) catchUp(ctx context.Context, now time.Time) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var err error
+	now, err = normalizeRunnerTime(now)
+	if err != nil {
+		return err
+	}
+	current, err := r.loadRunnerState(ctx)
+	if err != nil {
+		return err
+	}
+	reloadedAfterContention := false
 	for {
-		changed, err := r.RunOnce(ctx, now)
+		changed, err := r.advanceOnce(ctx, now, current)
+		if errors.Is(err, cll.ErrContention) && !reloadedAfterContention {
+			current, err = r.loadRunnerState(ctx)
+			if err != nil {
+				return err
+			}
+			reloadedAfterContention = true
+			continue
+		}
 		if err != nil {
 			return err
 		}
 		if !changed {
 			return nil
 		}
+		reloadedAfterContention = false
 	}
 }

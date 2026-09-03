@@ -1,2 +1,2 @@
-// Package sqlite provides an embedded transactional ledger store.
+// Package sqlite implements the interoperable transactional SQLite CLL backend.
 package sqlite

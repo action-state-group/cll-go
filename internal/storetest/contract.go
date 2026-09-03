@@ -1,520 +1,274 @@
-// Package storetest defines the behavior shared by every ledger Store backend.
+// Package storetest contains the shared behavioral contract for every backend.
 package storetest
 
 import (
-	"crypto/ed25519"
-	"crypto/rand"
-	_ "embed"
-	"encoding/hex"
-	"encoding/json"
-	"fmt"
+	"bytes"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/action-state-group/agent-action-capsule/go/canonical"
-	aacverify "github.com/action-state-group/agent-action-capsule/go/verify"
-	"github.com/action-state-group/capsule-emit-go"
-	"github.com/action-state-group/cll-go/ledger"
-	"github.com/stretchr/testify/assert"
+	"github.com/action-state-group/cll-go/cll"
 	"github.com/stretchr/testify/require"
 )
 
-const validCapsule = `{"action_id":"v4-chain","action_type":"decide","assurance":{"attestation_mode":"self_attested","effect_mode":"not_applicable","ledger_mode":"chained"},"canonicalization_id":"jcs","capsule_id":"862024869f00481bb4f59d9528a45c2d4885f64c5222a9324a38ac2c2cd119f2","chain":{"parent_capsule_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","relation":"confirms"},"constraints":[],"developer":"agent@v1","disposition":{"approver":"policy","decision":"accept","human_disposed":false,"verdict_class":"executed"},"format_version":"4","operator":"ACME-CO","spec_version":"draft-mih-scitt-agent-action-capsule-04","timestamp":"2026-08-24T00:00:00Z"}`
+var contractTime = time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
 
-// capsuleEmitV051 is the first upstream capsule-emit 0.5.1 interoperability
-// fixture from agent-action-capsule commit
-// 7e112c8b877ad79d4d2a53be7b522a63470a2b1d (BSD-3-Clause), at
-// python/tests/fixtures/capsule_emit_ledger.jsonl.
-//
-//go:embed testdata/capsule-emit-v0.5.1.json
-var capsuleEmitV051 []byte
+func Value(value byte) []byte { return bytes.Repeat([]byte{value}, cll.EntryBytes) }
 
-type Factory func(t *testing.T, logID string) ledger.Store
-type CLLFactory func(t *testing.T, logID string) ledger.CLLStore
-type RebaselineStore interface {
-	ledger.Store
-	ledger.Rebaseliner
-}
-type RebaselineFactory func(t *testing.T, logID string) RebaselineStore
-
-func Run(t *testing.T, open Factory) {
+// Run exercises the complete portable contract against one fresh backend.
+func Run(t *testing.T, store cll.Backend) {
 	t.Helper()
-	t.Run("append read idempotency and conflict", func(t *testing.T) {
-		store := open(t, "contract-basic")
-		input := appendInput(1)
-		record, outcome, err := store.Append(t.Context(), input)
-		require.NoError(t, err)
-		assert.Equal(t, ledger.AppendInserted, outcome)
-		assert.Equal(t, uint64(1), record.Seq)
-		stored, err := store.Get(t.Context(), input.CapsuleID)
-		require.NoError(t, err)
-		assert.Equal(t, record, stored)
+	ctx := t.Context()
+	observedTime := contractTime.Add(123456789 * time.Nanosecond)
+	normalizedTime := contractTime.Add(123 * time.Millisecond)
 
-		_, outcome, err = store.Append(t.Context(), input)
-		require.NoError(t, err)
-		assert.Equal(t, ledger.AppendIdempotent, outcome)
-		conflict := input
-		conflict.Capsule = []byte("different")
-		_, _, err = store.Append(t.Context(), conflict)
-		assert.ErrorIs(t, err, ledger.ErrConflict)
-
-		stored.Capsule[0] ^= 0xff
-		stored.Verification.Assurance["effect_mode"] = "tampered"
-		*stored.Verification.Findings[0].Check = 99
-		again, err := store.Get(t.Context(), input.CapsuleID)
-		require.NoError(t, err)
-		assert.Equal(t, input.Capsule, again.Capsule)
-		assert.Equal(t, "confirmed", again.Verification.Assurance["effect_mode"])
-		assert.Equal(t, 1, *again.Verification.Findings[0].Check)
-	})
-
-	t.Run("envelope scan projections and gaps", func(t *testing.T) {
-		store := open(t, "contract-query")
-		first := appendInput(1)
-		first.ParentID = capsuleID(99)
-		_, _, err := store.Append(t.Context(), first)
-		require.NoError(t, err)
-		_, _, err = store.Append(t.Context(), appendInput(2))
-		require.NoError(t, err)
-
-		envelope := ledger.Envelope{Digest: "4c503ca67761e5c4aaecfe996244c25d8c0b40902d1085c85b4468bd567548c6", Bytes: []byte("envelope"), AddedAt: first.AppendedAt}
-		_, outcome, err := store.AddEnvelope(t.Context(), ledger.EnvelopeInput{CapsuleID: first.CapsuleID, Envelope: envelope})
-		require.NoError(t, err)
-		assert.Equal(t, ledger.EnvelopeInserted, outcome)
-		retry := envelope
-		retry.AddedAt = envelope.AddedAt.Add(time.Hour)
-		retry.Verification.OK = true
-		storedEnvelope, outcome, err := store.AddEnvelope(t.Context(), ledger.EnvelopeInput{CapsuleID: first.CapsuleID, Envelope: retry})
-		require.NoError(t, err)
-		assert.Equal(t, ledger.EnvelopeIdempotent, outcome)
-		assert.Equal(t, envelope, storedEnvelope)
-		invalidEnvelope := envelope
-		invalidEnvelope.Digest = ledger.EnvelopeDigest(fmt.Sprintf("%064x", 10))
-		_, _, err = store.AddEnvelope(t.Context(), ledger.EnvelopeInput{CapsuleID: first.CapsuleID, Envelope: invalidEnvelope})
-		assert.ErrorIs(t, err, ledger.ErrInvalid)
-		_, _, err = store.AddEnvelope(t.Context(), ledger.EnvelopeInput{CapsuleID: capsuleID(99), Envelope: envelope})
-		assert.ErrorIs(t, err, ledger.ErrNotFound)
-		replayed, appendOutcome, err := store.Append(t.Context(), first)
-		require.NoError(t, err)
-		assert.Equal(t, ledger.AppendIdempotent, appendOutcome)
-		require.Len(t, replayed.Envelopes, 1)
-
-		records, err := store.Scan(t.Context(), 0, 1)
-		require.NoError(t, err)
-		require.Len(t, records, 1)
-		assert.Equal(t, uint64(1), records[0].Seq)
-		entries, err := store.ScanIDs(t.Context(), 1, 10)
-		require.NoError(t, err)
-		require.Len(t, entries, 1)
-		assert.Equal(t, uint64(2), entries[0].Seq)
-		assert.Equal(t, appendInput(2).CapsuleID, entries[0].CapsuleID)
-		cllEntries, err := store.ScanEntries(t.Context(), 1, 10)
-		require.NoError(t, err)
-		require.Len(t, cllEntries, 1)
-		expectedValue, err := hex.DecodeString(string(entries[0].CapsuleID))
-		require.NoError(t, err)
-		assert.Equal(t, expectedValue, cllEntries[0].Value)
-		assert.Equal(t, entries[0].Seq, cllEntries[0].Seq)
-		gaps, err := store.FindChainGaps(t.Context())
-		require.NoError(t, err)
-		require.Len(t, gaps, 1)
-		assert.Equal(t, first.CapsuleID, gaps[0].CapsuleID)
-		_, err = store.Scan(t.Context(), 0, 0)
-		assert.ErrorIs(t, err, ledger.ErrInvalid)
-		_, err = store.ScanIDs(t.Context(), 0, 0)
-		assert.ErrorIs(t, err, ledger.ErrInvalid)
-		_, err = store.ScanEntries(t.Context(), 0, 0)
-		assert.ErrorIs(t, err, ledger.ErrInvalid)
-	})
-
-	t.Run("concurrent sequence allocation", func(t *testing.T) {
-		store := open(t, "contract-concurrent")
-		const count = 16
-		var wg sync.WaitGroup
-		errors := make(chan error, count)
-		for index := 1; index <= count; index++ {
-			input := appendInput(index)
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				_, _, err := store.Append(t.Context(), input)
-				errors <- err
-			}()
-		}
-		wg.Wait()
-		close(errors)
-		for err := range errors {
-			require.NoError(t, err)
-		}
-		entries, err := store.ScanIDs(t.Context(), 0, count+1)
-		require.NoError(t, err)
-		require.Len(t, entries, count)
-		for index, entry := range entries {
-			assert.Equal(t, uint64(index+1), entry.Seq)
-		}
-	})
-
-	t.Run("portable timestamp precision", func(t *testing.T) {
-		store := open(t, "contract-time")
-		input := appendInput(1)
-		input.AppendedAt = input.AppendedAt.Add(1234 * time.Nanosecond)
-		record, _, err := store.Append(t.Context(), input)
-		require.NoError(t, err)
-		assert.Equal(t, ledger.NormalizeTime(input.AppendedAt), record.AppendedAt)
-		envelope := ledger.Envelope{Digest: "4c503ca67761e5c4aaecfe996244c25d8c0b40902d1085c85b4468bd567548c6", Bytes: []byte("envelope"), AddedAt: input.AppendedAt}
-		stored, _, err := store.AddEnvelope(t.Context(), ledger.EnvelopeInput{CapsuleID: input.CapsuleID, Envelope: envelope})
-		require.NoError(t, err)
-		assert.Equal(t, ledger.NormalizeTime(input.AppendedAt), stored.AddedAt)
-	})
-
-	t.Run("close is idempotent and terminal", func(t *testing.T) {
-		store := open(t, "contract-close")
-		require.NoError(t, store.Close())
-		require.NoError(t, store.Close())
-		_, err := store.Get(t.Context(), capsuleID(1))
-		assert.ErrorIs(t, err, ledger.ErrClosed)
-	})
-}
-
-// RunAdmission applies the Python admission contract and capsule-emit's
-// embedded-envelope shape to a Store backend through the public Service
-// boundary.
-func RunAdmission(t *testing.T, open Factory) {
-	t.Helper()
-	capsule := []byte(validCapsule)
-	validEnvelope := producerEnvelope(t, capsule)
-	sealedCapsule := withEmbeddedEnvelope(t, capsule, validEnvelope)
-	strippedCapsule := withoutEmbeddedEnvelope(t, capsuleEmitV051)
-	wrongCapsule := mutateCapsule(t, capsule, "v4-chain-wrong-envelope")
-	wrongEnvelope := producerEnvelope(t, wrongCapsule)
-
-	t.Run("declared unsigned records explicit state", func(t *testing.T) {
-		_, service := newService(t, open, "admission-unsigned")
-		record, err := service.Append(t.Context(), ledger.AdmissionUnsigned, capsule)
-		require.NoError(t, err)
-		assert.Equal(t, ledger.AuthenticityUnsigned, record.Authenticity)
-		assert.Empty(t, record.Envelopes)
-	})
-
-	t.Run("declared signed missing envelope rejects before mutation", func(t *testing.T) {
-		store, service := newService(t, open, "admission-missing")
-		_, err := service.Append(t.Context(), ledger.AdmissionSigned, capsule)
-		require.ErrorIs(t, err, ledger.ErrAdmission)
-		require.ErrorIs(t, err, ledger.ErrInvalid)
-		assertEmptyStore(t, store)
-	})
-
-	t.Run("declared signed invalid envelope rejects before mutation", func(t *testing.T) {
-		store, service := newService(t, open, "admission-invalid")
-		_, err := service.Append(t.Context(), ledger.AdmissionSigned, capsule, wrongEnvelope)
-		require.ErrorIs(t, err, ledger.ErrAdmission)
-		assertEmptyStore(t, store)
-	})
-
-	t.Run("declared signed mixed valid and invalid envelopes keeps valid evidence", func(t *testing.T) {
-		_, service := newService(t, open, "admission-mixed")
-		record, err := service.Append(t.Context(), ledger.AdmissionSigned, capsule, wrongEnvelope, validEnvelope)
-		require.NoError(t, err)
-		assert.Equal(t, ledger.AuthenticitySigned, record.Authenticity)
-		require.Len(t, record.Envelopes, 1)
-		assert.Equal(t, validEnvelope, record.Envelopes[0].Bytes)
-	})
-
-	t.Run("declared signed valid envelope persists and reverifies", func(t *testing.T) {
-		const logID = "admission-valid"
-		store, service := newService(t, open, logID)
-		record, err := service.Append(t.Context(), ledger.AdmissionSigned, capsule, validEnvelope)
-		require.NoError(t, err)
-		assert.Equal(t, ledger.AuthenticitySigned, record.Authenticity)
-		require.Len(t, record.Envelopes, 1)
-		assert.Equal(t, validEnvelope, record.Envelopes[0].Bytes)
-		require.NoError(t, store.Close())
-		reopened := open(t, logID)
-		stored, err := reopened.Get(t.Context(), record.CapsuleID)
-		require.NoError(t, err)
-		require.Len(t, stored.Envelopes, 1)
-		verification, err := (ledger.AACVerifier{}).VerifyEnvelope(stored.CapsuleID, stored.Envelopes[0].Bytes)
-		require.NoError(t, err)
-		assert.True(t, verification.OK)
-		assert.Equal(t, stored.Envelopes[0].Verification.PublicKey, verification.PublicKey)
-	})
-
-	t.Run("declared signed accepts embedded capsule-emit envelope and persists it", func(t *testing.T) {
-		const logID = "admission-embedded"
-		store, service := newService(t, open, logID)
-		record, err := service.Append(t.Context(), ledger.AdmissionSigned, sealedCapsule)
-		require.NoError(t, err)
-		assert.Equal(t, ledger.AuthenticitySigned, record.Authenticity)
-		require.Len(t, record.Envelopes, 1)
-		assert.Equal(t, validEnvelope, record.Envelopes[0].Bytes)
-		require.NoError(t, store.Close())
-		reopened := open(t, logID)
-		stored, err := reopened.Get(t.Context(), record.CapsuleID)
-		require.NoError(t, err)
-		require.Len(t, stored.Envelopes, 1)
-		verification, err := (ledger.AACVerifier{}).VerifyEnvelope(stored.CapsuleID, stored.Envelopes[0].Bytes)
-		require.NoError(t, err)
-		assert.True(t, verification.OK)
-	})
-
-	t.Run("capsule-emit 0.5.1 fixture admits and verifies from embedded evidence", func(t *testing.T) {
-		_, service := newService(t, open, "admission-capsule-emit-v051")
-		record, err := service.Append(t.Context(), ledger.AdmissionSigned, capsuleEmitV051)
-		require.NoError(t, err)
-		assert.Equal(t, ledger.CapsuleID("d0fd4075205b125aeede15b74528c3713ed6dbae40c6fd321cad7ab31ca569bb"), record.CapsuleID)
-		require.Len(t, record.Envelopes, 1)
-		verification, err := (ledger.AACVerifier{}).VerifyEnvelope(record.CapsuleID, record.Envelopes[0].Bytes)
-		require.NoError(t, err)
-		assert.Equal(t, record.Envelopes[0].Verification.PublicKey, verification.PublicKey)
-	})
-
-	t.Run("duplicate explicit and embedded evidence persists once", func(t *testing.T) {
-		_, service := newService(t, open, "admission-embedded-deduplicate")
-		record, err := service.Append(t.Context(), ledger.AdmissionSigned, sealedCapsule, validEnvelope)
-		require.NoError(t, err)
-		require.Len(t, record.Envelopes, 1)
-		assert.Equal(t, validEnvelope, record.Envelopes[0].Bytes)
-	})
-
-	t.Run("declared signed rejects capsule with stripped embedded envelope", func(t *testing.T) {
-		store, service := newService(t, open, "admission-stripped-embedded")
-		_, err := service.Append(t.Context(), ledger.AdmissionSigned, strippedCapsule)
-		require.ErrorIs(t, err, ledger.ErrAdmission)
-		assertEmptyStore(t, store)
-	})
-
-	t.Run("declared signed rejects embedded key id mismatch", func(t *testing.T) {
-		store, service := newService(t, open, "admission-embedded-key-mismatch")
-		embeddedCapsule := withEmbeddedFields(t, capsule, hex.EncodeToString(validEnvelope), hex.EncodeToString(make([]byte, ed25519.PublicKeySize)))
-		_, err := service.Append(t.Context(), ledger.AdmissionSigned, embeddedCapsule)
-		require.ErrorIs(t, err, ledger.ErrAdmission)
-		assertEmptyStore(t, store)
-	})
-
-	t.Run("declared signed skips malformed embedded candidate when explicit evidence verifies", func(t *testing.T) {
-		_, service := newService(t, open, "admission-malformed-embedded")
-		malformed := withEmbeddedFields(t, capsule, "not-hex", hex.EncodeToString(make([]byte, ed25519.PublicKeySize)))
-		record, err := service.Append(t.Context(), ledger.AdmissionSigned, malformed, validEnvelope)
-		require.NoError(t, err)
-		require.Len(t, record.Envelopes, 1)
-		assert.Equal(t, validEnvelope, record.Envelopes[0].Bytes)
-	})
-
-	t.Run("declared unsigned ignores embedded envelope fields", func(t *testing.T) {
-		_, service := newService(t, open, "admission-unsigned-embedded")
-		record, err := service.Append(t.Context(), ledger.AdmissionUnsigned, sealedCapsule)
-		require.NoError(t, err)
-		assert.Equal(t, ledger.AuthenticityUnsigned, record.Authenticity)
-		assert.Empty(t, record.Envelopes)
-	})
-
-	t.Run("signed retry cannot upgrade an unsigned admission", func(t *testing.T) {
-		store, service := newService(t, open, "admission-mode-conflict")
-		unsigned, err := service.Append(t.Context(), ledger.AdmissionUnsigned, sealedCapsule)
-		require.NoError(t, err)
-		_, err = service.Append(t.Context(), ledger.AdmissionSigned, sealedCapsule)
-		require.ErrorIs(t, err, ledger.ErrConflict)
-		stored, err := store.Get(t.Context(), unsigned.CapsuleID)
-		require.NoError(t, err)
-		assert.Equal(t, ledger.AuthenticityUnsigned, stored.Authenticity)
-		assert.Empty(t, stored.Envelopes)
-	})
-
-	t.Run("local-only transport changes retain identity but conflict with stored bytes", func(t *testing.T) {
-		_, service := newService(t, open, "admission-local-only-conflict")
-		_, sealedID, err := (ledger.AACVerifier{}).VerifyCapsule(capsuleEmitV051)
-		require.NoError(t, err)
-		_, strippedID, err := (ledger.AACVerifier{}).VerifyCapsule(strippedCapsule)
-		require.NoError(t, err)
-		assert.Equal(t, sealedID, strippedID)
-		record, err := service.Append(t.Context(), ledger.AdmissionSigned, capsuleEmitV051)
-		require.NoError(t, err)
-		require.Len(t, record.Envelopes, 1)
-		_, err = service.Append(t.Context(), ledger.AdmissionSigned, strippedCapsule, record.Envelopes[0].Bytes)
-		require.ErrorIs(t, err, ledger.ErrConflict)
-	})
-
-	t.Run("too many distinct verified candidates rejects", func(t *testing.T) {
-		store, service := newService(t, open, "admission-too-many-verified")
-		explicit := make([][]byte, ledger.MaxEnvelopesPerCapsule)
-		for index := range explicit {
-			explicit[index] = producerEnvelope(t, capsule)
-		}
-		_, err := service.Append(t.Context(), ledger.AdmissionSigned, sealedCapsule, explicit...)
-		require.ErrorIs(t, err, ledger.ErrInvalid)
-		assertEmptyStore(t, store)
-	})
-}
-
-func newService(t *testing.T, open Factory, logID string) (ledger.Store, *ledger.Service) {
-	t.Helper()
-	store := open(t, logID)
-	service, err := ledger.New(store, ledger.Config{})
-	require.NoError(t, err)
-	return store, service
-}
-
-func assertEmptyStore(t *testing.T, store ledger.Store) {
-	t.Helper()
-	entries, err := store.ScanIDs(t.Context(), 0, 1)
-	require.NoError(t, err)
-	assert.Empty(t, entries)
-}
-
-func producerEnvelope(t *testing.T, capsule []byte) []byte {
-	t.Helper()
-	_, privateKey, err := ed25519.GenerateKey(rand.Reader)
-	require.NoError(t, err)
-	identity, err := emit.NewEd25519SigningIdentity(privateKey)
-	require.NoError(t, err)
-	_, capsuleID, err := (ledger.AACVerifier{}).VerifyCapsule(capsule)
-	require.NoError(t, err)
-	envelope, err := emit.Sign(emit.BuiltPayload{CapsuleID: string(capsuleID), JSON: capsule}, identity)
-	require.NoError(t, err)
-	return envelope
-}
-
-func withEmbeddedEnvelope(t *testing.T, capsule, envelope []byte) []byte {
-	t.Helper()
-	_, capsuleID, err := (ledger.AACVerifier{}).VerifyCapsule(capsule)
-	require.NoError(t, err)
-	verification, err := (ledger.AACVerifier{}).VerifyEnvelope(capsuleID, envelope)
-	require.NoError(t, err)
-	return withEmbeddedFields(t, capsule, hex.EncodeToString(envelope), hex.EncodeToString(verification.PublicKey))
-}
-
-func withEmbeddedFields(t *testing.T, capsule []byte, signature, keyID string) []byte {
-	t.Helper()
-	return rewriteCapsule(t, capsule, func(value map[string]any) {
-		value["signature"] = signature
-		value["key_id"] = keyID
-	})
-}
-
-func withoutEmbeddedEnvelope(t *testing.T, capsule []byte) []byte {
-	t.Helper()
-	return rewriteCapsule(t, capsule, func(value map[string]any) {
-		delete(value, "signature")
-		delete(value, "key_id")
-	})
-}
-
-func mutateCapsule(t *testing.T, capsule []byte, actionID string) []byte {
-	t.Helper()
-	return rewriteCapsule(t, capsule, func(value map[string]any) {
-		value["action_id"] = actionID
-		id, err := canonical.ComputeCapsuleID(value)
-		require.NoError(t, err)
-		value["capsule_id"] = id
-	})
-}
-
-func rewriteCapsule(t *testing.T, capsule []byte, mutate func(map[string]any)) []byte {
-	t.Helper()
-	decoded, err := aacverify.DecodeCapsuleJSON(capsule)
-	require.NoError(t, err)
-	value, ok := decoded.(map[string]any)
-	require.True(t, ok)
-	mutate(value)
-	encoded, err := json.Marshal(value)
-	require.NoError(t, err)
-	return encoded
-}
-
-func RunCLL(t *testing.T, open CLLFactory) {
-	t.Helper()
-	store := open(t, "contract-cll")
-	created := time.Date(2026, 8, 25, 3, 0, 0, 0, time.UTC)
-	cp := ledger.CheckpointRecord{IndexedSeq: 1, MMRSize: 1, Root: fmt.Sprintf("%064x", 1), Payload: []byte("payload"), SignedCheckpoint: []byte("statement"), CreatedAt: created}
-	err := store.CommitCLL(t.Context(), ledger.CLLMutation{ExpectedIndexedSeq: 0, IndexedSeq: 1, Nodes: []ledger.MMRNode{{Position: 0, Hash: make([]byte, 32)}}, Checkpoint: &cp, WitnessIDs: []string{"a", "b"}})
-	require.NoError(t, err)
-	state, err := store.LoadCLL(t.Context())
-	require.NoError(t, err)
-	assert.Equal(t, uint64(1), state.IndexedSeq)
-	require.Len(t, state.Nodes, 1)
-	require.Len(t, state.Checkpoints, 1)
-
-	err = store.CommitCLL(t.Context(), ledger.CLLMutation{ExpectedIndexedSeq: 0, IndexedSeq: 2, Nodes: []ledger.MMRNode{{Position: 1, Hash: make([]byte, 32)}}})
-	assert.ErrorIs(t, err, ledger.ErrConflict)
-	state, err = store.LoadCLL(t.Context())
-	require.NoError(t, err)
-	require.Len(t, state.Nodes, 1)
-
-	pending, err := store.PendingWitnesses(t.Context(), "a", 10)
-	require.NoError(t, err)
-	require.Len(t, pending, 1)
-	require.NoError(t, store.CommitWitness(t.Context(), ledger.WitnessResult{WitnessID: "a", MMRSize: 1, State: ledger.WitnessVerified, Receipt: []byte("receipt"), AttemptedAt: created}))
-	delivery, err := store.GetWitness(t.Context(), "a", 1)
-	require.NoError(t, err)
-	assert.Equal(t, ledger.WitnessVerified, delivery.State)
-	assert.Equal(t, uint64(1), delivery.Attempts)
-	assert.Equal(t, created, delivery.LastAttemptAt)
-	assert.Equal(t, []byte("receipt"), delivery.Receipt)
-	pending, err = store.PendingWitnesses(t.Context(), "a", 10)
-	require.NoError(t, err)
-	assert.Empty(t, pending)
-	pending, err = store.PendingWitnesses(t.Context(), "b", 10)
-	require.NoError(t, err)
-	require.Len(t, pending, 1)
-	secondCheckpoint := ledger.CheckpointRecord{IndexedSeq: 2, MMRSize: 3, Root: fmt.Sprintf("%064x", 2), Payload: []byte("payload-2"), SignedCheckpoint: []byte("statement-2"), CreatedAt: created.Add(time.Minute)}
-	require.NoError(t, store.CommitCLL(t.Context(), ledger.CLLMutation{ExpectedIndexedSeq: 1, IndexedSeq: 2, Nodes: []ledger.MMRNode{{Position: 1, Hash: make([]byte, 32)}, {Position: 2, Hash: make([]byte, 32)}}, Checkpoint: &secondCheckpoint, WitnessIDs: []string{"b"}}))
-	require.NoError(t, store.CommitWitness(t.Context(), ledger.WitnessResult{WitnessID: "b", MMRSize: 1, State: ledger.WitnessContinuityConflict, Error: "fork", AttemptedAt: created}))
-	pending, err = store.PendingWitnesses(t.Context(), "b", 10)
-	require.NoError(t, err)
-	assert.Empty(t, pending)
-	err = store.CommitWitness(t.Context(), ledger.WitnessResult{WitnessID: "b", MMRSize: 1, State: ledger.WitnessVerified, Receipt: []byte("late"), AttemptedAt: created.Add(time.Minute)})
-	assert.ErrorIs(t, err, ledger.ErrConflict)
-}
-
-func RunRebaseline(t *testing.T, open RebaselineFactory) {
-	t.Helper()
-	store := open(t, "old-log")
-	input := appendInput(1)
-	_, _, err := store.Append(t.Context(), input)
-	require.NoError(t, err)
-	cp := ledger.CheckpointRecord{IndexedSeq: 1, MMRSize: 1, Root: fmt.Sprintf("%064x", 1), Payload: []byte("payload"), SignedCheckpoint: []byte("statement"), CreatedAt: input.AppendedAt}
-	require.NoError(t, store.CommitCLL(t.Context(), ledger.CLLMutation{ExpectedIndexedSeq: 0, IndexedSeq: 1, Nodes: []ledger.MMRNode{{Position: 0, Hash: make([]byte, 32)}}, Checkpoint: &cp, WitnessIDs: []string{"anchor", "anchor-conflict"}}))
-	require.NoError(t, store.CommitWitness(t.Context(), ledger.WitnessResult{WitnessID: "anchor", MMRSize: 1, State: ledger.WitnessVerified, Receipt: []byte("receipt"), AttemptedAt: input.AppendedAt}))
-	require.NoError(t, store.CommitWitness(t.Context(), ledger.WitnessResult{WitnessID: "anchor-conflict", MMRSize: 1, State: ledger.WitnessContinuityConflict, Error: "fork", AttemptedAt: input.AppendedAt}))
-	record, err := store.Rebaseline(t.Context(), ledger.RebaselineInput{NewLogID: "new-log", Reason: "continuity conflict", At: input.AppendedAt.Add(time.Hour), MigrationID: "migration-1"})
-	require.NoError(t, err)
-	assert.Equal(t, "old-log", record.OldLogID)
-	assert.Equal(t, "new-log", record.NewLogID)
-	assert.Equal(t, uint64(1), record.LastWitnessedSize)
-	history, err := store.Rebaselines(t.Context(), 10)
-	require.NoError(t, err)
-	require.Equal(t, []ledger.RebaselineRecord{record}, history)
-	_, err = store.Rebaselines(t.Context(), 0)
-	assert.ErrorIs(t, err, ledger.ErrInvalid)
-	state, err := store.LoadCLL(t.Context())
-	require.NoError(t, err)
-	assert.Equal(t, "new-log", state.LogID)
-	assert.True(t, state.ForceCheckpoint)
-	assert.Empty(t, state.Checkpoints)
-	require.Len(t, state.Nodes, 1)
-	stored, err := store.Get(t.Context(), input.CapsuleID)
-	require.NoError(t, err)
-	assert.Equal(t, uint64(1), stored.Seq)
-	second := appendInput(2)
-	stored, _, err = store.Append(t.Context(), second)
-	require.NoError(t, err)
-	assert.Equal(t, uint64(2), stored.Seq)
-	_, err = store.Rebaseline(t.Context(), ledger.RebaselineInput{NewLogID: "old-log", Reason: "must collide", At: input.AppendedAt.Add(2 * time.Hour), MigrationID: "migration-2"})
-	assert.ErrorIs(t, err, ledger.ErrInvalid)
-}
-
-func appendInput(number int) ledger.AppendInput {
-	check := 1
-	return ledger.AppendInput{
-		CapsuleID:    capsuleID(number),
-		Capsule:      []byte(fmt.Sprintf(`{"capsule":%d}`, number)),
-		Authenticity: ledger.AuthenticityUnsigned,
-		Verification: ledger.VerificationResult{OK: true, CapsuleID: capsuleID(number), Assurance: map[string]string{"effect_mode": "confirmed"}, Findings: []ledger.Finding{{Code: "test", Check: &check}}},
-		AppendedAt:   time.Date(2026, 8, 25, 1, 2, number%60, 0, time.UTC),
+	var wait sync.WaitGroup
+	results := make(chan cll.AppendResult, 2)
+	errorsOut := make(chan error, 2)
+	inputValues := [][]byte{Value(1), Value(2)}
+	for _, value := range inputValues {
+		wait.Add(1)
+		go func(value []byte) {
+			defer wait.Done()
+			result, err := store.Append(ctx, cll.AppendInput{Value: value, AppendedAt: observedTime})
+			results <- result
+			errorsOut <- err
+		}(value)
 	}
+	wait.Wait()
+	close(results)
+	close(errorsOut)
+	for err := range errorsOut {
+		require.NoError(t, err)
+	}
+	sequences := map[uint64]bool{}
+	for result := range results {
+		sequences[result.Entry.Seq] = true
+	}
+	require.Equal(t, map[uint64]bool{1: true, 2: true}, sequences)
+	inputValues[0][0] = 97
+
+	duplicate, err := store.Append(ctx, cll.AppendInput{Value: Value(1), AppendedAt: contractTime.Add(10 * time.Second)})
+	require.NoError(t, err)
+	require.Equal(t, cll.AppendIdempotent, duplicate.Outcome)
+	require.Equal(t, normalizedTime, duplicate.Entry.AppendedAt)
+
+	entries, err := store.ScanEntries(ctx, 0, 2)
+	require.NoError(t, err)
+	require.Len(t, entries, 2)
+	entries[0].Value[0] = 99
+	stored, err := store.GetEntry(ctx, Value(1))
+	require.NoError(t, err)
+	require.Equal(t, byte(1), stored.Value[0])
+	stored.Value[0] = 98
+	storedAgain, err := store.GetEntry(ctx, Value(1))
+	require.NoError(t, err)
+	require.Equal(t, byte(1), storedAgain.Value[0])
+
+	callerValue := Value(1)
+	appended, err := store.Append(ctx, cll.AppendInput{Value: callerValue, AppendedAt: contractTime})
+	require.NoError(t, err)
+	callerValue[0] = 97
+	appended.Entry.Value[0] = 97
+	storedCallerValue, err := store.GetEntry(ctx, Value(1))
+	require.NoError(t, err)
+	require.Equal(t, byte(1), storedCallerValue.Value[0])
+
+	_, err = store.Append(ctx, cll.AppendInput{Value: []byte{1}, AppendedAt: contractTime})
+	require.ErrorIs(t, err, cll.ErrInvalid)
+	_, err = store.ScanEntries(ctx, 0, 0)
+	require.ErrorIs(t, err, cll.ErrInvalid)
+	_, err = store.ScanEntries(ctx, 0, cll.MaxScanLimit+1)
+	require.ErrorIs(t, err, cll.ErrInvalid)
+	_, err = store.GetEntry(ctx, Value(9))
+	require.ErrorIs(t, err, cll.ErrNotFound)
+
+	node := Value(3)
+	checkpoint := []byte("checkpoint")
+	pending := cll.WitnessState{WitnessID: "primary", CheckpointSize: 1, Checkpoint: checkpoint, NextAttemptAt: contractTime}
+	invalidMMR := cll.State{Size: 2, Nodes: [][]byte{Value(3), Value(4)}, IndexedSeq: 1}
+	err = store.CommitCLL(ctx, 0, nil, invalidMMR)
+	require.ErrorIs(t, err, cll.ErrInvalid)
+	next := cll.State{Size: 1, Nodes: [][]byte{node}, IndexedSeq: 1, Checkpoint: &cll.CheckpointState{Bytes: checkpoint, Size: 1, IndexedSeq: 1, Peaks: [][]byte{node}}, Witnesses: []cll.WitnessState{pending}}
+	require.NoError(t, store.CommitCLL(ctx, 0, nil, next))
+
+	next.Nodes[0][0] = 88
+	next.Checkpoint.Bytes[0] = 'x'
+	node = Value(3)
+	checkpoint = []byte("checkpoint")
+
+	state, err := store.LoadCLL(ctx)
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), state.IndexedSeq)
+	require.Equal(t, checkpoint, state.Checkpoint.Bytes)
+	state.Nodes[0][0] = 88
+	state.Witnesses[0].Checkpoint[0] = 88
+	unchanged, err := store.LoadCLL(ctx)
+	require.NoError(t, err)
+	require.Equal(t, byte(3), unchanged.Nodes[0][0])
+	require.Equal(t, byte('c'), unchanged.Witnesses[0].Checkpoint[0])
+
+	pendingRows, err := store.PendingWitnesses(ctx, contractTime, 1)
+	require.NoError(t, err)
+	require.Len(t, pendingRows, 1)
+	pendingRows[0].Checkpoint[0] = 'x'
+	persistedPending, err := store.GetWitness(ctx, "primary", 1)
+	require.NoError(t, err)
+	require.Equal(t, byte('c'), persistedPending.Checkpoint[0])
+	pendingRows, err = store.PendingWitnesses(ctx, contractTime, 1)
+	require.NoError(t, err)
+	_, err = store.PendingWitnesses(ctx, contractTime, cll.MaxWitnesses+1)
+	require.ErrorIs(t, err, cll.ErrInvalid)
+	witness := pendingRows[0]
+	witness.Attempts = 1
+	witness.NextAttemptAt = contractTime.Add(time.Minute)
+	require.NoError(t, store.CommitWitness(ctx, 0, witness))
+	storedWitness, err := store.GetWitness(ctx, "primary", 1)
+	require.NoError(t, err)
+	require.Equal(t, uint32(1), storedWitness.Attempts)
+	storedWitness.Checkpoint[0] = 'x'
+	storedWitness, err = store.GetWitness(ctx, "primary", 1)
+	require.NoError(t, err)
+	require.Equal(t, byte('c'), storedWitness.Checkpoint[0])
+	oversizedReason := storedWitness
+	oversizedReason.Attempts++
+	oversizedReason.LastError = strings.Repeat("x", cll.MaxReasonBytes+1)
+	err = store.CommitWitness(ctx, storedWitness.Attempts, oversizedReason)
+	require.ErrorIs(t, err, cll.ErrInvalid)
+	oversizedReceipt := storedWitness
+	oversizedReceipt.Attempts++
+	oversizedReceipt.Receipt = &cll.WitnessReceiptState{Bytes: make([]byte, cll.MaxWitnessResponseBytes+1)}
+	err = store.CommitWitness(ctx, storedWitness.Attempts, oversizedReceipt)
+	require.ErrorIs(t, err, cll.ErrInvalid)
+
+	second := cll.WitnessState{WitnessID: "secondary", CheckpointSize: 1, Checkpoint: checkpoint, NextAttemptAt: contractTime}
+	stale := unchanged
+	stale.Witnesses = append(stale.Witnesses, second)
+	require.NoError(t, store.CommitCLL(ctx, stale.Size, stale.Checkpoint.Bytes, stale))
+	storedWitness, err = store.GetWitness(ctx, "primary", 1)
+	require.NoError(t, err)
+	require.Equal(t, uint32(1), storedWitness.Attempts, "CommitCLL must preserve the current witness row")
+	leafIndex, treeSize := int64(0), int64(1)
+	withReceipt := storedWitness
+	withReceipt.Attempts++
+	withReceipt.Receipt = &cll.WitnessReceiptState{Bytes: []byte("receipt"), LeafIndex: &leafIndex, TreeSize: &treeSize}
+	require.NoError(t, store.CommitWitness(ctx, storedWitness.Attempts, withReceipt))
+	withReceipt.Receipt.Bytes[0] = 'x'
+	*withReceipt.Receipt.LeafIndex = 9
+	storedReceipt, err := store.GetWitness(ctx, "primary", 1)
+	require.NoError(t, err)
+	require.NotNil(t, storedReceipt.Receipt)
+	require.NotNil(t, storedReceipt.Receipt.LeafIndex)
+	require.Equal(t, []byte("receipt"), storedReceipt.Receipt.Bytes)
+	require.Equal(t, int64(0), *storedReceipt.Receipt.LeafIndex)
+	storedReceipt.Receipt.Bytes[0] = 'x'
+	storedReceipt, err = store.GetWitness(ctx, "primary", 1)
+	require.NoError(t, err)
+	require.NotNil(t, storedReceipt.Receipt)
+	require.Equal(t, []byte("receipt"), storedReceipt.Receipt.Bytes)
+
+	err = store.CommitWitness(ctx, 0, cll.WitnessState{WitnessID: "missing", CheckpointSize: 1, Checkpoint: checkpoint, NextAttemptAt: contractTime})
+	require.ErrorIs(t, err, cll.ErrContention)
+	err = store.CommitCLL(ctx, 0, nil, unchanged)
+	require.ErrorIs(t, err, cll.ErrContention)
+	invalid := unchanged
+	invalid.Nodes = append(invalid.Nodes, []byte{1})
+	invalid.Size++
+	err = store.CommitCLL(ctx, unchanged.Size, unchanged.Checkpoint.Bytes, invalid)
+	require.ErrorIs(t, err, cll.ErrInvalid)
+
+	current, err := store.LoadCLL(ctx)
+	require.NoError(t, err)
+	forward := current
+	forward.Nodes = append(append([][]byte(nil), current.Nodes...), Value(4), Value(5))
+	forward.Size = 3
+	forward.IndexedSeq = 2
+	forward.Checkpoint = &cll.CheckpointState{Bytes: []byte("checkpoint-2"), Size: 3, IndexedSeq: 2, Peaks: [][]byte{Value(5)}}
+	require.NoError(t, store.CommitCLL(ctx, current.Size, current.Checkpoint.Bytes, forward))
+
+	badPrefix, err := store.LoadCLL(ctx)
+	require.NoError(t, err)
+	badPrefix.Nodes[0][0] = 99
+	err = store.CommitCLL(ctx, badPrefix.Size, badPrefix.Checkpoint.Bytes, badPrefix)
+	require.ErrorIs(t, err, cll.ErrInvalid)
+
+	removedCheckpoint, err := store.LoadCLL(ctx)
+	require.NoError(t, err)
+	removedCheckpoint.Checkpoint = nil
+	err = store.CommitCLL(ctx, removedCheckpoint.Size, []byte("checkpoint-2"), removedCheckpoint)
+	require.ErrorIs(t, err, cll.ErrContention)
+
+	backwardCheckpoint, err := store.LoadCLL(ctx)
+	require.NoError(t, err)
+	backwardCheckpoint.Checkpoint = &cll.CheckpointState{Bytes: []byte("checkpoint"), Size: 1, IndexedSeq: 1, Peaks: [][]byte{Value(3)}}
+	err = store.CommitCLL(ctx, backwardCheckpoint.Size, []byte("checkpoint-2"), backwardCheckpoint)
+	require.ErrorIs(t, err, cll.ErrContention)
+
+	changedCheckpoint, err := store.LoadCLL(ctx)
+	require.NoError(t, err)
+	changedCheckpoint.Checkpoint.Bytes = []byte("changed")
+	err = store.CommitCLL(ctx, changedCheckpoint.Size, []byte("checkpoint-2"), changedCheckpoint)
+	require.ErrorIs(t, err, cll.ErrContention)
+
+	oversizedCheckpoint, err := store.LoadCLL(ctx)
+	require.NoError(t, err)
+	oversizedCheckpoint.Checkpoint.Bytes = make([]byte, cll.MaxCheckpointBytes+1)
+	err = store.CommitCLL(ctx, oversizedCheckpoint.Size, []byte("checkpoint-2"), oversizedCheckpoint)
+	require.ErrorIs(t, err, cll.ErrInvalid)
+
+	require.NoError(t, store.Close())
+	require.NoError(t, store.Close())
+	_, err = store.ScanEntries(ctx, 0, 1)
+	require.ErrorIs(t, err, cll.ErrClosed)
+	_, err = store.ScanEntries(ctx, cll.MaxPortableInteger+1, 0)
+	require.ErrorIs(t, err, cll.ErrClosed)
+	_, err = store.GetEntry(ctx, []byte{1})
+	require.ErrorIs(t, err, cll.ErrClosed)
+	_, err = store.GetWitness(ctx, "", 0)
+	require.ErrorIs(t, err, cll.ErrClosed)
+	_, err = store.LoadCLL(ctx)
+	require.ErrorIs(t, err, cll.ErrClosed)
+	err = store.CommitCLL(ctx, 0, nil, cll.State{Size: 2})
+	require.ErrorIs(t, err, cll.ErrClosed)
+	_, err = store.PendingWitnesses(ctx, time.Time{}, 0)
+	require.ErrorIs(t, err, cll.ErrClosed)
+	err = store.CommitWitness(ctx, 0, cll.WitnessState{})
+	require.ErrorIs(t, err, cll.ErrClosed)
+	_, err = store.Append(ctx, cll.AppendInput{Value: Value(8), AppendedAt: contractTime})
+	require.ErrorIs(t, err, cll.ErrClosed)
 }
 
-func capsuleID(number int) ledger.CapsuleID {
-	return ledger.CapsuleID(fmt.Sprintf("%064x", number))
+// CrossHandle verifies dense allocation and shared visibility across handles.
+func CrossHandle(t *testing.T, first, second cll.Backend) {
+	t.Helper()
+	ctx := t.Context()
+	var wait sync.WaitGroup
+	results := make(chan cll.AppendResult, 2)
+	errs := make(chan error, 2)
+	for index, store := range []cll.Backend{first, second} {
+		wait.Add(1)
+		go func(index int, store cll.Backend) {
+			defer wait.Done()
+			result, err := store.Append(ctx, cll.AppendInput{Value: Value(byte(index + 3)), AppendedAt: contractTime})
+			results <- result
+			errs <- err
+		}(index, store)
+	}
+	wait.Wait()
+	close(results)
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+	sequences := map[uint64]bool{}
+	for result := range results {
+		sequences[result.Entry.Seq] = true
+	}
+	require.Equal(t, map[uint64]bool{1: true, 2: true}, sequences)
+	for _, store := range []cll.Backend{first, second} {
+		entries, err := store.ScanEntries(ctx, 0, 10)
+		require.NoError(t, err)
+		require.Len(t, entries, 2)
+	}
 }

@@ -1,278 +1,129 @@
 package jsonl
 
 import (
-	"bytes"
-	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
+	"encoding/binary"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/action-state-group/cll-go/cll"
 	"github.com/action-state-group/cll-go/internal/storetest"
-	"github.com/action-state-group/cll-go/ledger"
+	"github.com/action-state-group/cll-go/mmr"
 	"github.com/stretchr/testify/require"
 )
 
-func TestStoreContract(t *testing.T) {
-	roots := make(map[string]string)
-	open := func(t *testing.T, logID string) ledger.Store {
-		root, exists := roots[logID]
-		if !exists {
-			root = t.TempDir()
-			roots[logID] = root
-		}
-		store, err := Open(root, logID)
-		require.NoError(t, err)
-		t.Cleanup(func() { require.NoError(t, store.Close()) })
-		return store
-	}
-	storetest.Run(t, open)
-	storetest.RunAdmission(t, open)
-}
-
-func TestCLLValidationHasNoStateEffectsBeforeJournalCommit(t *testing.T) {
-	store, err := Open(t.TempDir(), "force-log")
+func TestContractAndReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cll.jsonl")
+	store, err := Open(path)
 	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, store.Close()) })
-	store.cll.ForceCheckpoint = true
-	mutation := ledger.CLLMutation{
-		IndexedSeq: 1,
-		Nodes:      []ledger.MMRNode{{Position: 0, Hash: make([]byte, 32)}},
-		Checkpoint: &ledger.CheckpointRecord{IndexedSeq: 1, MMRSize: 1, Root: fmt.Sprintf("%064x", 1), Payload: []byte("payload"), SignedCheckpoint: []byte("statement"), CreatedAt: time.Now().UTC()},
-	}
-	require.NoError(t, store.validateCLL(mutation))
-	require.True(t, store.cll.ForceCheckpoint)
-}
+	storetest.Run(t, store)
 
-func TestCLLStoreContract(t *testing.T) {
-	storetest.RunCLL(t, func(t *testing.T, logID string) ledger.CLLStore {
-		store, err := Open(t.TempDir(), logID)
-		require.NoError(t, err)
-		t.Cleanup(func() { require.NoError(t, store.Close()) })
-		return store
-	})
-}
-
-func TestRebaselineContract(t *testing.T) {
-	storetest.RunRebaseline(t, func(t *testing.T, logID string) storetest.RebaselineStore {
-		store, err := Open(t.TempDir(), logID)
-		require.NoError(t, err)
-		t.Cleanup(func() { require.NoError(t, store.Close()) })
-		return store
-	})
-}
-
-const testID = ledger.CapsuleID("862024869f00481bb4f59d9528a45c2d4885f64c5222a9324a38ac2c2cd119f2")
-
-func TestStoreAppendEnvelopeRestartAndGap(t *testing.T) {
-	root := t.TempDir()
-	store, err := Open(root, "test-log")
-	require.NoError(t, err)
-
-	input := ledger.AppendInput{
-		CapsuleID: testID, Capsule: []byte(`{"capsule_id":"one"}`),
-		Authenticity: ledger.AuthenticityUnsigned,
-		ParentID:     ledger.CapsuleID("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-		AppendedAt:   time.Date(2026, 8, 25, 0, 0, 0, 0, time.UTC),
-	}
-	record, outcome, err := store.Append(t.Context(), input)
-	require.NoError(t, err)
-	require.Equal(t, ledger.AppendInserted, outcome)
-	require.Equal(t, uint64(1), record.Seq)
-
-	_, outcome, err = store.Append(t.Context(), input)
-	require.NoError(t, err)
-	require.Equal(t, ledger.AppendIdempotent, outcome)
-
-	conflict := input
-	conflict.Capsule = []byte(`{"capsule_id":"different"}`)
-	_, _, err = store.Append(t.Context(), conflict)
-	require.ErrorIs(t, err, ledger.ErrConflict)
-
-	envelope := ledger.Envelope{Digest: "4c503ca67761e5c4aaecfe996244c25d8c0b40902d1085c85b4468bd567548c6", Bytes: []byte("envelope"), AddedAt: input.AppendedAt}
-	_, addOutcome, err := store.AddEnvelope(t.Context(), ledger.EnvelopeInput{CapsuleID: testID, Envelope: envelope})
-	require.NoError(t, err)
-	require.Equal(t, ledger.EnvelopeInserted, addOutcome)
-	_, addOutcome, err = store.AddEnvelope(t.Context(), ledger.EnvelopeInput{CapsuleID: testID, Envelope: envelope})
-	require.NoError(t, err)
-	require.Equal(t, ledger.EnvelopeIdempotent, addOutcome)
-
-	gaps, err := store.FindChainGaps(t.Context())
-	require.NoError(t, err)
-	require.Len(t, gaps, 1)
-	require.NoError(t, store.Close())
-
-	reopened, err := Open(root, "test-log")
+	reopened, err := Open(path)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, reopened.Close()) })
-	restored, err := reopened.Get(t.Context(), testID)
+	entries, err := reopened.ScanEntries(t.Context(), 0, 10)
 	require.NoError(t, err)
-	require.Equal(t, record.Capsule, restored.Capsule)
-	require.Len(t, restored.Envelopes, 1)
-	entries, err := reopened.ScanIDs(t.Context(), 0, 10)
+	require.Len(t, entries, 2)
+	state, err := reopened.LoadCLL(t.Context())
 	require.NoError(t, err)
-	require.Equal(t, []ledger.LogEntry{{Seq: 1, CapsuleID: testID, AppendedAt: input.AppendedAt}}, entries)
-
-	restored.Capsule[0] = 'X'
-	again, err := reopened.Get(t.Context(), testID)
-	require.NoError(t, err)
-	require.NotEqual(t, restored.Capsule, again.Capsule)
+	require.Equal(t, uint64(2), state.IndexedSeq)
 }
 
-func TestStoreRejectsSecondWriter(t *testing.T) {
-	root := t.TempDir()
-	first, err := Open(root, "test-log")
+func TestWriterLockAndTornTail(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cll.jsonl")
+	first, err := Open(path)
 	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, first.Close()) })
+	_, err = Open(path)
+	require.ErrorIs(t, err, cll.ErrContention)
+	require.NoError(t, first.Close())
 
-	second, err := Open(root, "test-log")
-	require.Error(t, err)
-	require.Nil(t, second)
-}
-
-func TestStoreTruncatesUnterminatedTailButRejectsEarlierCorruption(t *testing.T) {
-	root := t.TempDir()
-	store, err := Open(root, "test-log")
-	require.NoError(t, err)
-	_, _, err = store.Append(t.Context(), ledger.AppendInput{CapsuleID: testID, Capsule: []byte("capsule"), Authenticity: ledger.AuthenticityUnsigned, AppendedAt: time.Now().UTC()})
-	require.NoError(t, err)
-	require.NoError(t, store.Close())
-
-	path := filepath.Join(root, journalName)
 	file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0)
 	require.NoError(t, err)
-	_, err = file.WriteString(`{"version":1`)
+	_, err = file.WriteString("{torn")
 	require.NoError(t, err)
 	require.NoError(t, file.Close())
-
-	recovered, err := Open(root, "test-log")
+	reopened, err := Open(path)
 	require.NoError(t, err)
-	require.NoError(t, recovered.Close())
-
-	content, err := os.ReadFile(path)
+	require.NoError(t, reopened.Close())
+	data, err := os.ReadFile(path)
 	require.NoError(t, err)
-	corrupt := append([]byte("not-json\n"), content...)
-	require.NoError(t, os.WriteFile(path, corrupt, 0o600))
-	failed, err := Open(root, "test-log")
-	require.ErrorIs(t, err, ledger.ErrCorrupt)
-	require.Nil(t, failed)
+	require.NotContains(t, string(data), "{torn")
 }
 
-func TestOpenRejectsVersionTwoJournal(t *testing.T) {
-	root := t.TempDir()
-	record := []byte("{\"version\":2,\"type\":\"log.init\",\"log_id\":\"test-log\"}\n")
-	require.NoError(t, os.WriteFile(filepath.Join(root, journalName), record, 0o600))
-
-	store, err := Open(root, "test-log")
-	require.ErrorIs(t, err, ledger.ErrCorrupt)
-	require.Nil(t, store)
-}
-
-func TestOpenRejectsSignedRecordWithStrippedEnvelope(t *testing.T) {
-	root := t.TempDir()
-	store, err := Open(root, "stripped")
-	require.NoError(t, err)
-	now := time.Now().UTC()
-	envelopeBytes := []byte("signed-envelope")
-	digest := sha256.Sum256(envelopeBytes)
-	id := ledger.CapsuleID("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-	_, _, err = store.Append(t.Context(), ledger.AppendInput{
-		CapsuleID: id, Capsule: []byte(`{"v":4}`), Authenticity: ledger.AuthenticitySigned, AppendedAt: now,
-		Envelopes: []ledger.Envelope{{Digest: ledger.EnvelopeDigest(hex.EncodeToString(digest[:])), Bytes: envelopeBytes, Verification: ledger.EnvelopeVerification{OK: true, PublicKey: make([]byte, 32)}, AddedAt: now}},
-	})
-	require.NoError(t, err)
-	require.NoError(t, store.Close())
-
-	path := filepath.Join(root, journalName)
-	raw, err := os.ReadFile(path)
-	require.NoError(t, err)
-	lines := bytes.Split(bytes.TrimSpace(raw), []byte("\n"))
-	for index := range lines {
-		var item event
-		require.NoError(t, json.Unmarshal(lines[index], &item))
-		if item.Record != nil {
-			item.Record.Envelopes = nil
-			lines[index], err = json.Marshal(item)
-			require.NoError(t, err)
-		}
+func TestRejectsLegacyAndCompleteCorruption(t *testing.T) {
+	for name, data := range map[string]string{
+		"legacy":  "{\"version\":3,\"type\":\"log.init\"}\n",
+		"corrupt": "{\"version\":4,\"type\":\"cll.init\"}\n{not-json}\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "cll.jsonl")
+			require.NoError(t, os.WriteFile(path, []byte(data), 0o600))
+			store, err := Open(path)
+			require.Nil(t, store)
+			require.ErrorIs(t, err, cll.ErrCorrupt)
+		})
 	}
-	require.NoError(t, os.WriteFile(path, append(bytes.Join(lines, []byte("\n")), '\n'), 0o600))
-	_, err = Open(root, "stripped")
-	require.ErrorIs(t, err, ledger.ErrCorrupt)
-	require.ErrorContains(t, err, "signed record has no verified envelope")
 }
 
-func TestStoreHonorsCanceledContext(t *testing.T) {
-	store, err := Open(t.TempDir(), "test-log")
+func TestCLLCommitStoresOnlyNodeDelta(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cll.jsonl")
+	store, err := Open(path)
 	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, store.Close()) })
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	_, err = store.Get(ctx, testID)
-	require.True(t, errors.Is(err, context.Canceled))
+	nodes := make([][]byte, 127)
+	for index := range nodes {
+		nodes[index] = storetest.Value(byte(index))
+	}
+	require.NoError(t, store.CommitCLL(t.Context(), 0, nil, cll.State{Size: 127, Nodes: nodes, IndexedSeq: 64}))
+	next := append(append([][]byte(nil), nodes...), storetest.Value(128))
+	require.NoError(t, store.CommitCLL(t.Context(), 127, nil, cll.State{Size: 128, Nodes: next, IndexedSeq: 65}))
+	require.NoError(t, store.Close())
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	require.Len(t, lines, 3)
+	require.Less(t, len(lines[2]), len(lines[1])/2)
 }
 
-func TestStorePersistsCLLAndWitnessState(t *testing.T) {
-	root := t.TempDir()
-	store, err := Open(root, "test-log")
+func TestReplayManyCLLCommitDeltas(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cll.jsonl")
+	store, err := Open(path)
 	require.NoError(t, err)
-	created := time.Date(2026, 8, 25, 2, 0, 0, 0, time.UTC)
-	checkpoint := ledger.CheckpointRecord{IndexedSeq: 1, MMRSize: 1, Root: fmt.Sprintf("%064x", 1), Payload: []byte("payload"), SignedCheckpoint: []byte("statement"), CreatedAt: created}
-	err = store.CommitCLL(t.Context(), ledger.CLLMutation{
-		ExpectedIndexedSeq: 0, IndexedSeq: 1,
-		Nodes:      []ledger.MMRNode{{Position: 0, Hash: make([]byte, 32)}},
-		Checkpoint: &checkpoint, WitnessIDs: []string{"anchor-a", "anchor-b"},
-	})
+	tree, err := mmr.New(nil)
 	require.NoError(t, err)
-	pending, err := store.PendingWitnesses(t.Context(), "anchor-a", 10)
-	require.NoError(t, err)
-	require.Len(t, pending, 1)
-	require.NoError(t, store.CommitWitness(t.Context(), ledger.WitnessResult{WitnessID: "anchor-a", MMRSize: 1, State: ledger.WitnessVerified, AttemptedAt: created, Receipt: []byte("receipt")}))
+	started := contractReplayTime()
+	var size uint64
+	for sequence := uint64(1); sequence <= 256; sequence++ {
+		value := make([]byte, cll.EntryBytes)
+		binary.BigEndian.PutUint64(value[cll.EntryBytes-8:], sequence)
+		_, err = store.Append(t.Context(), cll.AppendInput{Value: value, AppendedAt: started})
+		require.NoError(t, err)
+		_, err = tree.Append(value)
+		require.NoError(t, err)
+		next := cll.State{Size: tree.Size(), Nodes: tree.Nodes(), IndexedSeq: sequence}
+		require.NoError(t, store.CommitCLL(t.Context(), size, nil, next))
+		size = next.Size
+	}
 	require.NoError(t, store.Close())
 
-	reopened, err := Open(root, "test-log")
+	reopened, err := Open(path)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, reopened.Close()) })
 	state, err := reopened.LoadCLL(t.Context())
 	require.NoError(t, err)
-	require.Equal(t, uint64(1), state.IndexedSeq)
-	require.Len(t, state.Nodes, 1)
-	require.Len(t, state.Checkpoints, 1)
-	pending, err = reopened.PendingWitnesses(t.Context(), "anchor-a", 10)
-	require.NoError(t, err)
-	require.Empty(t, pending)
-	pending, err = reopened.PendingWitnesses(t.Context(), "anchor-b", 10)
-	require.NoError(t, err)
-	require.Len(t, pending, 1)
+	require.Equal(t, uint64(256), state.IndexedSeq)
+	require.Equal(t, size, state.Size)
 }
 
-func TestStoreRebaselineRebindsJournal(t *testing.T) {
-	root := t.TempDir()
-	store, err := Open(root, "old-log")
-	require.NoError(t, err)
-	created := time.Now().UTC()
-	_, _, err = store.Append(t.Context(), ledger.AppendInput{CapsuleID: testID, Capsule: []byte("capsule"), Authenticity: ledger.AuthenticityUnsigned, AppendedAt: created})
-	require.NoError(t, err)
-	checkpoint := ledger.CheckpointRecord{IndexedSeq: 1, MMRSize: 1, Root: fmt.Sprintf("%064x", 1), Payload: []byte("payload"), SignedCheckpoint: []byte("statement"), CreatedAt: created}
-	require.NoError(t, store.CommitCLL(t.Context(), ledger.CLLMutation{IndexedSeq: 1, Nodes: []ledger.MMRNode{{Position: 0, Hash: make([]byte, 32)}}, Checkpoint: &checkpoint, WitnessIDs: []string{"anchor"}}))
-	require.NoError(t, store.CommitWitness(t.Context(), ledger.WitnessResult{WitnessID: "anchor", MMRSize: 1, State: ledger.WitnessContinuityConflict, Error: "fork", AttemptedAt: created}))
-	_, err = store.Rebaseline(t.Context(), ledger.RebaselineInput{NewLogID: "new-log", Reason: "anchor continuity conflict", At: time.Now().UTC(), MigrationID: "migration-1"})
-	require.NoError(t, err)
-	state, err := store.LoadCLL(t.Context())
-	require.NoError(t, err)
-	require.Equal(t, "new-log", state.LogID)
-	require.True(t, state.ForceCheckpoint)
-	require.NoError(t, store.Close())
+func contractReplayTime() time.Time {
+	return time.Date(2026, time.September, 3, 12, 0, 0, 0, time.UTC)
+}
 
-	reopened, err := Open(root, "new-log")
-	require.NoError(t, err)
-	require.NoError(t, reopened.Close())
-	old, err := Open(root, "old-log")
-	require.Error(t, err)
-	require.Nil(t, old)
+func TestCloseAfterOpenFailureReleasesLock(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cll.jsonl")
+	require.NoError(t, os.WriteFile(path, []byte("{not-json}\n"), 0o600))
+	_, err := Open(path)
+	require.True(t, errors.Is(err, cll.ErrCorrupt))
 }

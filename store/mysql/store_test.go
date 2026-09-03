@@ -2,103 +2,55 @@ package mysql
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
 	"os"
 	"testing"
 	"time"
 
+	"github.com/action-state-group/cll-go/cll"
 	"github.com/action-state-group/cll-go/internal/storetest"
-	"github.com/action-state-group/cll-go/ledger"
-	mysqlDriver "github.com/go-sql-driver/mysql"
+	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
-	containerMysql "github.com/testcontainers/testcontainers-go/modules/mysql"
+	containermysql "github.com/testcontainers/testcontainers-go/modules/mysql"
 )
 
-func TestStoreContract(t *testing.T) {
+func TestContractAndCrossHandle(t *testing.T) {
 	dsn, terminate := startMySQL(t)
 	t.Cleanup(terminate)
-	open := func(t *testing.T, logID string) ledger.Store {
-		store, err := Open(t.Context(), dsn, logID)
-		require.NoError(t, err)
-		t.Cleanup(func() { require.NoError(t, store.Close()) })
-		return store
-	}
-	storetest.Run(t, open)
-	storetest.RunAdmission(t, open)
-}
+	store, err := Open(t.Context(), dsn, "contract")
+	require.NoError(t, err)
+	storetest.Run(t, store)
 
-func TestCLLStoreContract(t *testing.T) {
-	dsn, terminate := startMySQL(t)
-	t.Cleanup(terminate)
-	storetest.RunCLL(t, func(t *testing.T, logID string) ledger.CLLStore {
-		store, err := Open(t.Context(), dsn, logID)
-		require.NoError(t, err)
-		t.Cleanup(func() { require.NoError(t, store.Close()) })
-		return store
+	first, err := Open(t.Context(), dsn, "shared")
+	require.NoError(t, err)
+	second, err := Open(t.Context(), dsn, "shared")
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, first.Close())
+		require.NoError(t, second.Close())
 	})
+	storetest.CrossHandle(t, first, second)
 }
 
-func TestRebaselineContract(t *testing.T) {
+func TestLegacyDetection(t *testing.T) {
 	dsn, terminate := startMySQL(t)
 	t.Cleanup(terminate)
-	storetest.RunRebaseline(t, func(t *testing.T, logID string) storetest.RebaselineStore {
-		store, err := Open(t.Context(), dsn, logID)
-		require.NoError(t, err)
-		t.Cleanup(func() { require.NoError(t, store.Close()) })
-		return store
-	})
-}
-
-func TestStoreLifecycleAndLogIsolation(t *testing.T) {
-	dsn, terminate := startMySQL(t)
-	t.Cleanup(terminate)
-	first, err := Open(t.Context(), dsn, "first")
-	require.NoError(t, err)
-	input := ledger.AppendInput{
-		CapsuleID:    ledger.CapsuleID("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-		Capsule:      []byte(`{"v":4}`),
-		Authenticity: ledger.AuthenticityUnsigned,
-		ParentID:     ledger.CapsuleID("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
-		AppendedAt:   time.Date(2026, 8, 25, 1, 2, 3, 0, time.UTC),
-	}
-	record, outcome, err := first.Append(t.Context(), input)
-	require.NoError(t, err)
-	require.Equal(t, ledger.AppendInserted, outcome)
-	require.Equal(t, uint64(1), record.Seq)
-
-	_, outcome, err = first.Append(t.Context(), input)
-	require.NoError(t, err)
-	require.Equal(t, ledger.AppendIdempotent, outcome)
-
-	envelope := ledger.Envelope{Digest: "4c503ca67761e5c4aaecfe996244c25d8c0b40902d1085c85b4468bd567548c6", Bytes: []byte("envelope"), AddedAt: input.AppendedAt}
-	_, addOutcome, err := first.AddEnvelope(t.Context(), ledger.EnvelopeInput{CapsuleID: input.CapsuleID, Envelope: envelope})
-	require.NoError(t, err)
-	require.Equal(t, ledger.EnvelopeInserted, addOutcome)
-	entries, err := first.ScanIDs(t.Context(), 0, 10)
-	require.NoError(t, err)
-	require.Equal(t, []ledger.LogEntry{{Seq: 1, CapsuleID: input.CapsuleID, AppendedAt: input.AppendedAt}}, entries)
-	gaps, err := first.FindChainGaps(t.Context())
-	require.NoError(t, err)
-	require.Len(t, gaps, 1)
-	require.NoError(t, first.Close())
-
-	second, err := Open(t.Context(), dsn, "second")
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, second.Close()) })
-	_, err = second.Get(t.Context(), input.CapsuleID)
-	require.ErrorIs(t, err, ledger.ErrNotFound)
-	require.NoError(t, second.Close())
-
 	db, err := sql.Open("mysql", dsn)
 	require.NoError(t, err)
-	_, err = db.ExecContext(t.Context(), `UPDATE schema_metadata SET version=2 WHERE singleton=1`)
+	_, err = db.ExecContext(t.Context(), "CREATE TABLE ledger_metadata(id INT)")
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
-	_, err = Open(t.Context(), dsn, "first")
-	require.ErrorIs(t, err, ledger.ErrCorrupt)
+	store, err := Open(t.Context(), dsn, "default")
+	require.Nil(t, store)
+	require.ErrorIs(t, err, cll.ErrCorrupt)
+}
+
+func TestClassifyContention(t *testing.T) {
+	for _, number := range []uint16{1062, 1205, 1213} {
+		err := classify(&mysqldriver.MySQLError{Number: number, Message: "contention"})
+		require.ErrorIs(t, err, cll.ErrContention)
+	}
 }
 
 func startMySQL(t *testing.T) (string, func()) {
@@ -106,10 +58,10 @@ func startMySQL(t *testing.T) (string, func()) {
 	if os.Getenv("CI") == "" {
 		testcontainers.SkipIfProviderIsNotHealthy(t)
 	}
-	container, err := containerMysql.Run(t.Context(), "mysql:8.0.36",
-		containerMysql.WithDatabase("ledger"),
-		containerMysql.WithUsername("ledger"),
-		containerMysql.WithPassword("password"),
+	container, err := containermysql.Run(t.Context(), "mysql:8.0.36",
+		containermysql.WithDatabase("cll"),
+		containermysql.WithUsername("cll"),
+		containermysql.WithPassword("password"),
 	)
 	require.NoError(t, err)
 	terminate := func() {
@@ -118,33 +70,4 @@ func startMySQL(t *testing.T) (string, func()) {
 		require.NoError(t, container.Terminate(ctx))
 	}
 	return container.MustConnectionString(t.Context()), terminate
-}
-
-func TestClassifyRetryableMySQLErrors(t *testing.T) {
-	for _, number := range []uint16{1205, 1213} {
-		err := classify(&mysqlDriver.MySQLError{Number: number, Message: "retry"})
-		require.ErrorIs(t, err, ledger.ErrRetryable)
-	}
-}
-
-func TestGetRejectsSignedRecordWithStrippedEnvelope(t *testing.T) {
-	dsn, terminate := startMySQL(t)
-	t.Cleanup(terminate)
-	store, err := Open(t.Context(), dsn, "stripped")
-	require.NoError(t, err)
-	now := time.Now().UTC()
-	envelopeBytes := []byte("signed-envelope")
-	digest := sha256.Sum256(envelopeBytes)
-	id := ledger.CapsuleID("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-	_, _, err = store.Append(t.Context(), ledger.AppendInput{
-		CapsuleID: id, Capsule: []byte(`{"v":4}`), Authenticity: ledger.AuthenticitySigned, AppendedAt: now,
-		Envelopes: []ledger.Envelope{{Digest: ledger.EnvelopeDigest(hex.EncodeToString(digest[:])), Bytes: envelopeBytes, Verification: ledger.EnvelopeVerification{OK: true, PublicKey: make([]byte, 32)}, AddedAt: now}},
-	})
-	require.NoError(t, err)
-	_, err = store.db.ExecContext(t.Context(), `DELETE FROM envelopes WHERE log_id=? AND capsule_id=?`, "stripped", id)
-	require.NoError(t, err)
-	_, err = store.Get(t.Context(), id)
-	require.ErrorIs(t, err, ledger.ErrCorrupt)
-	require.ErrorContains(t, err, "signed record has no verified envelope")
-	require.NoError(t, store.Close())
 }

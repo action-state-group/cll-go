@@ -1,4 +1,3 @@
-// Package cll defines the storage-neutral ordered-entry boundary consumed by
-// checkpointing. Application bindings decide what bytes an entry contains;
-// CLL only requires a gapless local sequence.
+// Package cll defines a storage-neutral Checkpointed Local Log contract.
+// Applications own record content and append only fixed-width opaque identities.
 package cll

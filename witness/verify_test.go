@@ -1,4 +1,4 @@
-package capsuleanchor
+package witness
 
 import (
 	"bytes"

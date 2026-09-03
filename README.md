@@ -1,257 +1,238 @@
 # cll-go
 
-`cll-go` is an embeddable Go implementation of a Checkpointed Local Log (CLL).
-It treats an Agent Action Capsule (AAC) format-4 ledger as one application
-binding rather than as the definition of the log.
+`cll-go` is an embeddable Go implementation of a Checkpointed Local Log
+(CLL). It stores a dense sequence of opaque 32-byte identities, commits those
+identities to an MMR, signs checkpoints, and can submit checkpoints to external
+witnesses.
 
-It provides:
-
-- application-neutral ordered 32-byte record identities consumed by
-  checkpointing;
-- an AAC binding for signature-free Capsules and independent Producer Envelopes;
-- a storage-neutral ledger with JSONL, SQLite, and MySQL implementations;
-- a narrow application-neutral `cll.Source` projection for CLL/MMR indexing;
-- signed checkpoints with explicit external witness clients and offline receipt
-  verification;
-- conformance with the current AAC v4, Python CLL, and capsule-anchor contracts;
-- explicit checkpoint and witness runners whose lifecycle belongs to the host;
-- signed Ed25519 checkpoint records interoperable with `capsule-emit`;
-- a bounded checkpoint-only witness REST client;
-- offline RFC 9162 receipt verification under a pinned authority key.
-
-The generic CLL commits ordered 32-byte record identities. Fixed width preserves
-leaf/interior domain separation in the MMR. The included AAC binding projects
-each verified Capsule ID into one entry. Producer Envelopes remain
-independently verified ledger associations and do not create CLL leaves.
+The library is application-neutral. It does not understand record bodies,
+signatures, authorization, application indexes, or business workflows. An
+application verifies and stores its complete record first, then appends the
+record's 32-byte identity to CLL.
 
 ## Install
 
-The end-to-end integration uses both the producer and ledger modules:
+Requires Go 1.27 or newer.
 
-```sh
-go get github.com/action-state-group/capsule-emit-go@latest
+```bash
 go get github.com/action-state-group/cll-go@latest
 ```
 
-## Storage
+## Append identities
 
-Choose one backend:
-
-```go
-jsonlStore, err := jsonl.Open("./ledger-data", "alchemy-investigations")
-sqliteStore, err := sqlite.Open("./ledger.db", "alchemy-investigations")
-mysqlStore, err := mysql.Open(ctx, dsn, "alchemy-investigations")
-```
-
-SQLite is the simplest transactional choice for one server process. JSONL is
-an inspectable append-only journal. MySQL supports shared infrastructure and is
-tested against a real MySQL 8 container.
-
-## End-to-end: Producer to Ledger to Witness
-
-The producer key signs one independent Producer Envelope. The checkpoint key
-signs the local CLL checkpoint. The pinned witness authority public key verifies
-the external service's receipt. These are three separate trust roles, and the
-host must provision and authorize their keys outside this library.
-
-This synchronous example sets the checkpoint cadence to one Capsule so the
-whole path is visible in one call. `witnessBaseURL` identifies an already-running
-checkpoint-only `capsule-anchor` deployment; this library does not start it.
+Choose a backend and append the identity of an already-persisted record:
 
 ```go
-package integration
+package main
 
 import (
-    "context"
-    "crypto/ed25519"
-    "errors"
-    "fmt"
-    "time"
+	"context"
+	"crypto/sha256"
+	"fmt"
+	"time"
 
-    "github.com/action-state-group/capsule-emit-go"
-
-    "github.com/action-state-group/cll-go/capsuleanchor"
-    "github.com/action-state-group/cll-go/checkpoint"
-    "github.com/action-state-group/cll-go/ledger"
-    "github.com/action-state-group/cll-go/store/sqlite"
+	"github.com/action-state-group/cll-go/cll"
+	"github.com/action-state-group/cll-go/store/memory"
 )
 
-func PublishInvestigation(
-    ctx context.Context,
-    databasePath string,
-    witnessBaseURL string,
-    producerPrivateKey ed25519.PrivateKey,
-    checkpointPrivateKey ed25519.PrivateKey,
-    witnessAuthorityPublicKey ed25519.PublicKey,
-) (finalErr error) {
-    const (
-        logID     = "alchemy-investigations-prod"
-        witnessID = "production-checkpoint-witness"
-    )
+func main() {
+	ctx := context.Background()
+	store := memory.New()
+	defer func() {
+		if err := store.Close(); err != nil {
+			panic(err)
+		}
+	}()
 
-    // Open one durable ledger stream. Reuse logID across process restarts.
-    store, err := sqlite.Open(databasePath, logID)
-    if err != nil {
-        return err
-    }
-    defer func() { finalErr = errors.Join(finalErr, store.Close()) }()
+	// The application owns and persists the complete record.
+	record := []byte(`{"order":"A-123","status":"approved"}`)
+	identity := sha256.Sum256(record)
 
-    // AAC format-4 verification is mandatory and owned by ledger.New. The
-    // host may add application vocabulary but cannot replace verification.
-    service, err := ledger.New(store, ledger.Config{
-        RegistryExtensions: map[string]map[string]bool{
-            "effect.type": {
-                "urn:alchemy:effect:github-issue-comment-publication:v1": true,
-            },
-        },
-    })
-    if err != nil {
-        return err
-    }
-
-    // Build a signature-free Capsule and one independent Producer Envelope.
-    producerIdentity, err := emit.NewEd25519SigningIdentity(producerPrivateKey)
-    if err != nil {
-        return err
-    }
-    produced, err := emit.Seal(emit.Input{
-        ActionID:   "investigation-123",
-        ActionType: emit.ActionTypeDecide,
-        Operator:   "alchemy",
-        Developer:  "alchemy@1.0.0",
-        Timestamp:  time.Now().UTC(),
-        Disposition: &emit.Disposition{
-            Decision:      emit.DecisionAccept,
-            Approver:      emit.ApproverPolicy,
-            VerdictClass:  emit.VerdictExecuted,
-            HumanDisposed: false,
-        },
-    }, producerIdentity)
-    if err != nil {
-        return err
-    }
-
-    // Verify exact Capsule and Envelope bytes, allocate seq, and persist them.
-    record, err := service.Append(ctx, ledger.AdmissionSigned, produced.Payload, produced.Envelope)
-    if err != nil {
-        return err
-    }
-    fmt.Printf("stored seq=%d capsule_id=%s\n", record.Seq, record.CapsuleID)
-
-    // Read new Capsule IDs from the same Store, advance the CLL/MMR, sign a
-    // checkpoint, and atomically create its pending witness-delivery row.
-    checkpointSigner, err := checkpoint.NewEd25519Signer(checkpointPrivateKey)
-    if err != nil {
-        return err
-    }
-    checkpointConfig := checkpoint.DefaultRunnerConfig(logID)
-    checkpointConfig.Cadence.CadenceEntries = 1 // demonstration only
-    checkpointConfig.WitnessIDs = []string{witnessID}
-    checkpointRunner, err := checkpoint.NewRunner(
-        checkpointConfig,
-        store,
-        checkpointSigner,
-    )
-    if err != nil {
-        return err
-    }
-    advanced, err := checkpointRunner.RunOnce(ctx, time.Now().UTC())
-    if err != nil {
-        return err
-    }
-    if !advanced {
-        return fmt.Errorf("checkpoint runner made no progress")
-    }
-
-    // POST the signed checkpoint to the external witness and verify its receipt
-    // locally under trust material provisioned independently of that server.
-    witnessClient, err := capsuleanchor.NewClient(witnessBaseURL, nil, 0)
-    if err != nil {
-        return err
-    }
-    receiptVerifier, err := capsuleanchor.NewReceiptVerifier(witnessAuthorityPublicKey)
-    if err != nil {
-        return err
-    }
-    deliveryRunner, err := capsuleanchor.NewDeliveryRunner(
-        capsuleanchor.DefaultDeliveryConfig(witnessID),
-        store,
-        witnessClient,
-        receiptVerifier,
-    )
-    if err != nil {
-        return err
-    }
-    attempted, err := deliveryRunner.RunOnce(ctx, time.Now().UTC())
-    if err != nil {
-        return err
-    }
-    if !attempted {
-        return fmt.Errorf("no checkpoint was ready for a delivery attempt")
-    }
-
-    state, err := store.LoadCLL(ctx)
-    if err != nil {
-        return err
-    }
-    if len(state.Checkpoints) == 0 {
-        return fmt.Errorf("checkpoint is missing")
-    }
-    latest := state.Checkpoints[len(state.Checkpoints)-1]
-    witnessed, err := store.GetWitness(ctx, witnessID, latest.MMRSize)
-    if err != nil {
-        return err
-    }
-    if witnessed.State != ledger.WitnessVerified {
-        return fmt.Errorf("witness delivery ended in state %s", witnessed.State)
-    }
-    return nil
+	result, err := store.Append(ctx, cll.AppendInput{
+		Value:      identity[:],
+		AppendedAt: time.Now().UTC(),
+	})
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("seq=%d outcome=%s\n", result.Entry.Seq, result.Outcome)
 }
 ```
 
-The call path is:
+Appending the same identity again is idempotent. It returns the original entry
+and timestamp with `cll.AppendIdempotent`.
 
-```text
-emit.Seal
-    -> Capsule + Producer Envelope
-ledger.Service.Append
-    -> durable Capsule record with seq
-checkpoint.Runner.RunOnce
-    -> durable CLL/MMR checkpoint + pending delivery
-capsuleanchor.DeliveryRunner.RunOnce
-    -> POST /checkpoints (raw COSE_Sign1)
-    -> offline receipt verification
-    -> durable verified witness result
+## Backends
+
+The same `cll.Backend` contract is implemented by:
+
+```go
+memoryStore := memory.New()
+jsonlStore, err := jsonl.Open("./cll.jsonl")
+sqliteStore, err := sqlite.Open("./cll.sqlite", "default")
+mysqlStore, err := mysql.Open(ctx, dsn, "default")
 ```
 
-The client accepts only the deployed checkpoint-only request and response
-profile. The witness verifies the checkpoint's self-contained Ed25519
-signature and returns an RFC 9162 receipt. It is stateless across checkpoints,
-so the receipt proves checkpoint registration and inclusion, not stream
-continuity or an independently attested time.
-See the [witness contract](DESIGN.md#witness-rest-and-trust) for the exact hash
-rules.
+- Memory is process-local and non-durable.
+- JSONL is an inspectable, single-writer append-only journal.
+- SQLite uses WAL transactions and supports multiple handles in one process.
+- MySQL uses transactional row locking and supports multiple processes.
 
-In a long-running Alchemy server, construct these objects once during startup
-and run `checkpointRunner.Run(serverContext)` and
-`deliveryRunner.Run(serverContext)` in server-owned goroutines. Request handlers
-only call the producer and `service.Append`. Calling `checkpointRunner.Notify()`
-after a successful append reduces latency; polling and durable cursors recover
-lost notifications and process restarts.
+SQLite and MySQL accept an explicit log ID. The TypeScript default is
+`"default"`; use that value when both runtimes must open the same log. A
+different ID selects a different logical log in the same database. JSONL holds
+one logical log per file.
 
-See [DESIGN.md](DESIGN.md) for wire contracts, persistence guarantees, trust
-boundaries, and pinned interoperability baselines.
+### Relational schema
 
-## Verification
+Go and TypeScript use the same four logical tables and column names:
 
-```sh
+| Table | Purpose | Key |
+| --- | --- | --- |
+| `cll_meta` | CLL cursor and latest checkpoint metadata | `log_id` |
+| `cll_entries` | Dense 1-based identities and append times | `log_id, seq`; identity is unique per log |
+| `cll_nodes` | Ordered MMR nodes | `log_id, position` |
+| `cll_witnesses` | Pending or completed witness delivery state | `log_id, witness_id, checkpoint_size` |
+
+SQLite uses `TEXT`, `BLOB`, and `INTEGER`. MySQL uses corresponding
+`VARCHAR(191)`, `LONGBLOB` or `BINARY(32)`, and unsigned integer types. Stored
+metadata, timestamps, decimal counters, base64 values, and witness JSON use the
+same portable encodings in both runtimes. See [DESIGN.md](DESIGN.md) for the
+exact DDL and transition contract.
+
+The current generic schema intentionally refuses the identifiable pre-1.0
+application-specific schema. Applications must migrate their business records
+and initialize a fresh generic CLL explicitly.
+
+### JSONL format
+
+JSONL v4 writes newline-delimited compact JSON events:
+
+- `cll.init`
+- `entry.append`
+- `cll.commit`
+- `witness.commit`
+
+Opening a v3 file returns `cll.ErrCorrupt`. A final incomplete line is removed
+on recovery, while a malformed complete line is rejected. The file is locked
+for the lifetime of the backend so a second writer receives
+`cll.ErrContention`.
+
+## Checkpoints
+
+`checkpoint.Runner` incrementally scans entries, updates the MMR, and persists
+signed checkpoints through the same backend:
+
+```go
+_, privateKey, err := ed25519.GenerateKey(rand.Reader)
+if err != nil {
+	return err
+}
+signer, err := checkpoint.NewEd25519Signer(privateKey)
+if err != nil {
+	return err
+}
+
+config := checkpoint.DefaultRunnerConfig("orders-prod")
+config.Cadence.CadenceEntries = 100
+config.WitnessIDs = []string{"witness.example"}
+
+runner, err := checkpoint.NewRunner(config, store, signer)
+if err != nil {
+	return err
+}
+changed, err := runner.RunOnce(ctx, time.Now().UTC())
+```
+
+For a server, construct the runner once and call `runner.Run(serverContext)` in
+a host-owned goroutine. `runner.Notify()` reduces latency after an append;
+durable cursors and polling recover lost notifications and restarts.
+
+Checkpoint COSE records remain byte-compatible with the TypeScript and Python
+CLL implementations.
+
+## External witnesses
+
+The `witness` package contains a bounded HTTP client, offline RFC 9162 receipt
+verification under a pinned Ed25519 authority key, and a durable retry runner:
+
+```go
+client, err := witness.NewClient(witnessBaseURL, nil, 0)
+if err != nil {
+	return err
+}
+verifier, err := witness.NewReceiptVerifier(witnessAuthorityPublicKey)
+if err != nil {
+	return err
+}
+
+delivery, err := witness.NewDeliveryRunner(
+	witness.DefaultDeliveryConfig(),
+	store,
+	map[string]witness.Submitter{"witness.example": client},
+	map[string]witness.Verifier{"witness.example": verifier},
+)
+if err != nil {
+	return err
+}
+_, err = delivery.RunOnce(ctx, time.Now().UTC(), cll.MaxWitnesses)
+```
+
+The host provisions checkpoint keys, witness endpoints, and pinned authority
+keys. Receipt verification proves registration and inclusion of the submitted
+checkpoint. It does not independently prove application-record semantics.
+
+## Add a backend
+
+TypeScript-style structural interfaces are expressed as Go interfaces in
+[`cll/types.go`](cll/types.go). A backend implements `cll.Backend`:
+
+```go
+type Backend interface {
+	EntryStore
+	CheckpointStateStore
+	WitnessStateStore
+	Close() error
+}
+```
+
+A new backend must preserve:
+
+- exact 32-byte identities and dense 1-based sequence allocation;
+- duplicate append idempotence with the original timestamp;
+- defensive copies at public boundaries;
+- compare-and-set behavior for CLL and witness state;
+- append-only nodes, checkpoint monotonicity, and stable error classes;
+- millisecond UTC timestamps and portable integer bounds;
+- bounded scans, witnesses, checkpoint bytes, and reason text;
+- safe concurrent access and idempotent close.
+
+For a backend contributed to this repository, reuse `internal/backend` for
+portable encoding and state transitions, then run `internal/storetest.Run` in
+its tests. Persistent multi-handle backends should also run
+`internal/storetest.CrossHandle`. Backend-specific tests must cover reopen,
+corruption or legacy-format refusal, and crash recovery.
+
+## Continuous integration
+
+GitHub Actions exposes separate checks for quality, unit tests, race tests,
+checkpoint wire interoperability, JSONL continuation, SQLite continuation, and
+MySQL continuation. Interoperability jobs build `cll-ts/main` and the Python
+CLL `main` at run time. The checkout SHAs in each job log make the moving-main
+comparison traceable.
+
+## Development
+
+```bash
+gofmt -w .
+go mod tidy
+go vet ./...
 go test ./...
 go test -race ./...
-go vet ./...
 ```
 
-MySQL tests use Testcontainers. They skip locally when Docker is unavailable,
-but Docker failure is a CI failure.
+MySQL tests use a real MySQL 8 Testcontainer. They skip locally when Docker is
+unavailable, but Docker failure is a CI failure.
 
 ## License
 

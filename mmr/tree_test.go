@@ -18,7 +18,7 @@ func TestBaggedInclusionRoundTrip(t *testing.T) {
 		"4444444444444444444444444444444444444444444444444444444444444444",
 	}
 	for _, id := range ids {
-		_, err := tree.AppendCapsuleID(id)
+		_, err := tree.AppendHexIdentity(id)
 		require.NoError(t, err)
 	}
 	root, err := tree.Root()
@@ -26,9 +26,9 @@ func TestBaggedInclusionRoundTrip(t *testing.T) {
 	for index, id := range ids {
 		proof, err := tree.InclusionProof(uint64(index))
 		require.NoError(t, err)
-		require.True(t, VerifyInclusion(root, tree.Size(), uint64(index), id, proof))
+		require.True(t, VerifyHexInclusion(root, tree.Size(), uint64(index), id, proof))
 		proof[0][0] ^= 0xff
-		require.False(t, VerifyInclusion(root, tree.Size(), uint64(index), id, proof))
+		require.False(t, VerifyHexInclusion(root, tree.Size(), uint64(index), id, proof))
 	}
 }
 
@@ -36,14 +36,14 @@ func TestBaggedConsistencyProofAcrossMultiPeakTrees(t *testing.T) {
 	tree, err := New(nil)
 	require.NoError(t, err)
 	for index := 1; index <= 3; index++ {
-		_, err = tree.AppendCapsuleID(fmt.Sprintf("%064x", index))
+		_, err = tree.AppendHexIdentity(fmt.Sprintf("%064x", index))
 		require.NoError(t, err)
 	}
 	oldSize := tree.Size()
 	oldRoot, err := tree.Root()
 	require.NoError(t, err)
 	for index := 4; index <= 7; index++ {
-		_, err = tree.AppendCapsuleID(fmt.Sprintf("%064x", index))
+		_, err = tree.AppendHexIdentity(fmt.Sprintf("%064x", index))
 		require.NoError(t, err)
 	}
 	newRoot, err := tree.Root()
@@ -61,7 +61,7 @@ func TestPeakHashesAtReturnsHistoricalCommitment(t *testing.T) {
 	tree, err := New(nil)
 	require.NoError(t, err)
 	for index := 1; index <= 5; index++ {
-		_, err = tree.AppendCapsuleID(fmt.Sprintf("%064x", index))
+		_, err = tree.AppendHexIdentity(fmt.Sprintf("%064x", index))
 		require.NoError(t, err)
 	}
 
@@ -96,8 +96,8 @@ func TestAppendApplicationNeutralValue(t *testing.T) {
 	require.NoError(t, err)
 	root, err := tree.Root()
 	require.NoError(t, err)
-	require.True(t, VerifyInclusionValue(root, tree.Size(), 0, value, proof))
-	require.False(t, VerifyInclusionValue(root, tree.Size(), 0, []byte("short"), proof))
+	require.True(t, VerifyInclusion(root, tree.Size(), 0, value, proof))
+	require.False(t, VerifyInclusion(root, tree.Size(), 0, []byte("short"), proof))
 
 	_, err = tree.Append(nil)
 	require.EqualError(t, err, "CLL leaf value must be exactly 32 bytes")
@@ -109,7 +109,7 @@ func TestEmptyRootAndAdversarialInputs(t *testing.T) {
 	root, err := tree.Root()
 	require.NoError(t, err)
 	require.Equal(t, make([]byte, 32), root)
-	require.False(t, VerifyInclusion(root, 0, 0, "bad", nil))
+	require.False(t, VerifyHexInclusion(root, 0, 0, "bad", nil))
 	_, err = New([][]byte{{1}})
 	require.Error(t, err)
 	_, err = New([][]byte{make([]byte, 32), make([]byte, 32)})
@@ -117,5 +117,5 @@ func TestEmptyRootAndAdversarialInputs(t *testing.T) {
 	corrupt := [][]byte{make([]byte, 32), make([]byte, 32), make([]byte, 32)}
 	_, err = New(corrupt)
 	require.Error(t, err)
-	require.False(t, VerifyInclusion(make([]byte, 32), 2, 0, fmt.Sprintf("%064x", 1), nil))
+	require.False(t, VerifyHexInclusion(make([]byte, 32), 2, 0, fmt.Sprintf("%064x", 1), nil))
 }

@@ -1,2 +1,2 @@
-// Package jsonl implements a single-writer append-only journal store.
+// Package jsonl implements the interoperable append-only JSONL v4 CLL backend.
 package jsonl

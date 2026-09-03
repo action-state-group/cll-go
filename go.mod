@@ -3,8 +3,6 @@ module github.com/action-state-group/cll-go
 go 1.27.0
 
 require (
-	github.com/action-state-group/agent-action-capsule/go v0.0.0-20260829034405-7e112c8b877a
-	github.com/action-state-group/capsule-emit-go v0.0.0-20260903001211-7dac75c65fa0
 	github.com/datatrails/go-datatrails-merklelog/mmr v0.4.2-0.20250428132117-275103a34a08
 	github.com/fxamacker/cbor/v2 v2.9.0
 	github.com/go-sql-driver/mysql v1.10.0

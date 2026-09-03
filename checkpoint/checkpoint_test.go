@@ -43,7 +43,7 @@ func TestCheckpointCanonicalSignAndVerify(t *testing.T) {
 	require.Error(t, signer.VerifyCheckpoint(tampered, statement))
 }
 
-func TestCapsuleAnchorFirstCheckpointVector(t *testing.T) {
+func TestFirstCheckpointVector(t *testing.T) {
 	seed := make([]byte, ed25519.SeedSize)
 	for index := range seed {
 		seed[index] = byte(index)
@@ -68,7 +68,7 @@ func TestCapsuleAnchorFirstCheckpointVector(t *testing.T) {
 	newPeak := bytes.Repeat([]byte{0xab}, 32)
 	statement, err := signer.SignCheckpoint(t.Context(), payload, [][]byte{newPeak}, nil, nil)
 	require.NoError(t, err)
-	// Independently accepted by capsule-anchor's checkpoint_cose parser at
+	// Independently accepted by the witness checkpoint parser at
 	// 26083a7bd7720267cdd4e3711e8d76689ea989be.
 	require.NotEmpty(t, fmt.Sprintf("%x", statement))
 	record, err := ParseRecord(statement)
@@ -79,7 +79,47 @@ func TestCapsuleAnchorFirstCheckpointVector(t *testing.T) {
 	require.NoError(t, record.VerifySignature())
 }
 
-func TestCapsuleEmitNonFirstCheckpointCarriesConsistencyProof(t *testing.T) {
+func TestCheckpointTimestampProfile(t *testing.T) {
+	signer, err := NewEd25519Signer(ed25519.NewKeyFromSeed(make([]byte, ed25519.SeedSize)))
+	require.NoError(t, err)
+	base := Payload{
+		LogID: "timestamp", KeyID: signer.KeyID(), MMRSize: 1,
+		Root: "abababababababababababababababababababababababababababababababab",
+	}
+
+	for _, test := range []struct {
+		name      string
+		timestamp time.Time
+		want      string
+	}{
+		{"Go zero time is a valid JavaScript date", time.Time{}, "0001-01-01T00:00:00Z"},
+		{"year zero", time.Date(0, time.January, 1, 0, 0, 0, 0, time.UTC), "0000-01-01T00:00:00Z"},
+		{"nanoseconds trim trailing zeros", time.Date(2026, time.September, 1, 12, 34, 56, 123456000, time.UTC), "2026-09-01T12:34:56.123456Z"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			payload := base
+			payload.Timestamp = test.timestamp
+			encoded, err := payload.CanonicalJSON()
+			require.NoError(t, err)
+			require.Contains(t, string(encoded), `"timestamp":"`+test.want+`"`)
+			parsed, err := ParsePayload(encoded)
+			require.NoError(t, err)
+			require.Equal(t, test.timestamp.UTC(), parsed.Timestamp)
+		})
+	}
+
+	for _, timestamp := range []time.Time{
+		time.Date(-1, time.January, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(10000, time.January, 1, 0, 0, 0, 0, time.UTC),
+	} {
+		payload := base
+		payload.Timestamp = timestamp
+		_, err := payload.CanonicalJSON()
+		require.Error(t, err)
+	}
+}
+
+func TestLinkedCheckpointCarriesConsistencyProof(t *testing.T) {
 	_, private, err := ed25519.GenerateKey(rand.Reader)
 	require.NoError(t, err)
 	signer, err := NewEd25519Signer(private)
@@ -87,14 +127,14 @@ func TestCapsuleEmitNonFirstCheckpointCarriesConsistencyProof(t *testing.T) {
 	tree, err := mmr.New(nil)
 	require.NoError(t, err)
 	for index := 1; index <= 3; index++ {
-		_, err = tree.AppendCapsuleID(fmt.Sprintf("%064x", index))
+		_, err = tree.AppendHexIdentity(fmt.Sprintf("%064x", index))
 		require.NoError(t, err)
 	}
 	oldSize := tree.Size()
 	oldRoot, err := tree.Root()
 	require.NoError(t, err)
 	for index := 4; index <= 7; index++ {
-		_, err = tree.AppendCapsuleID(fmt.Sprintf("%064x", index))
+		_, err = tree.AppendHexIdentity(fmt.Sprintf("%064x", index))
 		require.NoError(t, err)
 	}
 	newRoot, err := tree.Root()
@@ -118,8 +158,8 @@ func TestCapsuleEmitNonFirstCheckpointCarriesConsistencyProof(t *testing.T) {
 	require.True(t, mmr.VerifyConsistency(oldRoot, newRoot, *record.ConsistencyProof))
 }
 
-func TestCapsuleEmitCommitmentConformanceVectors(t *testing.T) {
-	// Pinned from capsule-emit aa9f2fd commitment-conformance-vectors/vectors.json.
+func TestCommitmentConformanceVectors(t *testing.T) {
+	// Pinned cross-language commitment-conformance vectors at aa9f2fd.
 	vectors := []struct {
 		name       string
 		peaks      []string
@@ -137,7 +177,9 @@ func TestCapsuleEmitCommitmentConformanceVectors(t *testing.T) {
 		t.Run(vector.name, func(t *testing.T) {
 			peaks := make([][]byte, len(vector.peaks))
 			for index, value := range vector.peaks {
-				peaks[index], _ = hex.DecodeString(value)
+				decoded, err := hex.DecodeString(value)
+				require.NoError(t, err)
+				peaks[index] = decoded
 			}
 			encoded, err := canonicalCBOR.Marshal(peaks)
 			require.NoError(t, err)

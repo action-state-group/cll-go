@@ -57,10 +57,11 @@ func New(nodes [][]byte) (*Tree, error) {
 	return tree, nil
 }
 
-func (t *Tree) AppendCapsuleID(capsuleID string) (uint64, error) {
-	id, err := hex.DecodeString(capsuleID)
-	if err != nil || len(id) != hashSize || hex.EncodeToString(id) != capsuleID {
-		return 0, fmt.Errorf("capsule id must be 64 lowercase hexadecimal characters")
+// AppendHexIdentity decodes and appends one lowercase hexadecimal identity.
+func (t *Tree) AppendHexIdentity(identity string) (uint64, error) {
+	id, err := hex.DecodeString(identity)
+	if err != nil || len(id) != hashSize || hex.EncodeToString(id) != identity {
+		return 0, fmt.Errorf("identity must be 64 lowercase hexadecimal characters")
 	}
 	return t.Append(id)
 }
@@ -178,7 +179,7 @@ func (t *Tree) ConsistencyProof(oldSize uint64) (ConsistencyProof, error) {
 }
 
 // VerifyConsistency validates the accumulator consistency proof carried by the
-// capsule-emit checkpoint COSE profile.
+// CLL checkpoint COSE profile.
 func VerifyConsistency(oldRoot, newRoot []byte, proof ConsistencyProof) bool {
 	if len(oldRoot) != hashSize || len(newRoot) != hashSize || proof.OldSize == 0 || proof.OldSize > proof.NewSize || !validMMRSize(proof.OldSize) || !validMMRSize(proof.NewSize) {
 		return false
@@ -297,18 +298,17 @@ func cloneWitness(input [][][]byte) [][][]byte {
 	return output
 }
 
-// VerifyInclusion validates an AAC Capsule ID leaf against a bagged MMR root.
-func VerifyInclusion(root []byte, mmrSize, leafIndex uint64, capsuleID string, proof [][]byte) bool {
-	id, err := hex.DecodeString(capsuleID)
-	if err != nil || len(id) != hashSize || hex.EncodeToString(id) != capsuleID {
+// VerifyHexInclusion decodes an identity and verifies its MMR inclusion proof.
+func VerifyHexInclusion(root []byte, mmrSize, leafIndex uint64, identity string, proof [][]byte) bool {
+	id, err := hex.DecodeString(identity)
+	if err != nil || len(id) != hashSize || hex.EncodeToString(id) != identity {
 		return false
 	}
-	return VerifyInclusionValue(root, mmrSize, leafIndex, id, proof)
+	return VerifyInclusion(root, mmrSize, leafIndex, id, proof)
 }
 
-// VerifyInclusionValue validates a generic 32-byte CLL record identity against
-// a bagged MMR root.
-func VerifyInclusionValue(root []byte, mmrSize, leafIndex uint64, value []byte, proof [][]byte) bool {
+// VerifyInclusion validates a 32-byte CLL identity against a bagged MMR root.
+func VerifyInclusion(root []byte, mmrSize, leafIndex uint64, value []byte, proof [][]byte) bool {
 	if len(root) != hashSize || !validMMRSize(mmrSize) || leafIndex >= dtmmr.LeafCount(mmrSize) || len(value) != hashSize {
 		return false
 	}

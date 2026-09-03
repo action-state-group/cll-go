@@ -9,11 +9,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"strconv"
 	"time"
 
-	"github.com/action-state-group/agent-action-capsule/go/canonical"
-	"github.com/action-state-group/cll-go/ledger"
+	"github.com/action-state-group/cll-go/cll"
 	"github.com/action-state-group/cll-go/mmr"
 	"github.com/fxamacker/cbor/v2"
 	"github.com/veraison/go-cose"
@@ -22,7 +20,7 @@ import (
 // MaxEncodedBytes bounds canonical checkpoint signing bodies and signed records.
 const MaxEncodedBytes = 64 << 10
 
-// Payload is the canonical checkpoint signing body shared with capsule-emit.
+// Payload is the canonical checkpoint signing body.
 type Payload struct {
 	LogID     string
 	KeyID     string
@@ -78,36 +76,53 @@ func (p Payload) CanonicalJSON() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	return canonical.JCS(fields)
+	return json.Marshal(fields)
 }
 
-func (p Payload) canonicalFields() (map[string]any, error) {
+type canonicalProjection struct {
+	KeyID     string `json:"key_id"`
+	Kind      string `json:"kind"`
+	LogID     string `json:"log_id"`
+	MMRSize   uint64 `json:"mmr_size"`
+	PrevRoot  string `json:"prev_root"`
+	PrevSize  uint64 `json:"prev_size"`
+	Root      string `json:"root"`
+	Timestamp string `json:"timestamp"`
+	Version   uint64 `json:"v"`
+}
+
+func (p Payload) canonicalFields() (canonicalProjection, error) {
 	key, keyErr := hex.DecodeString(p.KeyID)
-	if ledger.ValidateIdentifier(p.LogID) != nil || keyErr != nil || len(key) != ed25519.PublicKeySize || hex.EncodeToString(key) != p.KeyID || p.MMRSize == 0 || len(p.Root) != 64 || p.Timestamp.IsZero() {
-		return nil, fmt.Errorf("invalid checkpoint payload")
+	if cll.ValidateIdentifier(p.LogID) != nil || keyErr != nil || len(key) != ed25519.PublicKeySize || hex.EncodeToString(key) != p.KeyID || p.MMRSize == 0 || p.MMRSize > cll.MaxPortableInteger || p.PrevSize > cll.MaxPortableInteger || len(p.Root) != 64 {
+		return canonicalProjection{}, fmt.Errorf("invalid checkpoint payload")
 	}
 	if p.PrevSize >= p.MMRSize || (p.PrevSize == 0) != (p.PrevRoot == "") {
-		return nil, fmt.Errorf("invalid checkpoint predecessor")
+		return canonicalProjection{}, fmt.Errorf("invalid checkpoint predecessor")
 	}
 	if _, err := hex.DecodeString(p.Root); err != nil || p.Root != string(bytes.ToLower([]byte(p.Root))) {
-		return nil, fmt.Errorf("invalid checkpoint root")
+		return canonicalProjection{}, fmt.Errorf("invalid checkpoint root")
 	}
 	if p.PrevRoot != "" {
 		if decoded, err := hex.DecodeString(p.PrevRoot); err != nil || len(decoded) != 32 || p.PrevRoot != string(bytes.ToLower([]byte(p.PrevRoot))) {
-			return nil, fmt.Errorf("invalid previous checkpoint root")
+			return canonicalProjection{}, fmt.Errorf("invalid previous checkpoint root")
 		}
 	}
-	return map[string]any{
-		"key_id":    p.KeyID,
-		"kind":      "mmr_checkpoint",
-		"log_id":    p.LogID,
-		"mmr_size":  json.Number(strconv.FormatUint(p.MMRSize, 10)),
-		"prev_root": p.PrevRoot,
-		"prev_size": json.Number(strconv.FormatUint(p.PrevSize, 10)),
-		"root":      p.Root,
-		"timestamp": p.Timestamp.UTC().Format(time.RFC3339Nano),
-		"v":         json.Number("1"),
-	}, nil
+	timestamp, err := formatTimestamp(p.Timestamp)
+	if err != nil {
+		return canonicalProjection{}, err
+	}
+	return canonicalProjection{KeyID: p.KeyID, Kind: "mmr_checkpoint", LogID: p.LogID, MMRSize: p.MMRSize, PrevRoot: p.PrevRoot, PrevSize: p.PrevSize, Root: p.Root, Timestamp: timestamp, Version: 1}, nil
+}
+
+// formatTimestamp matches the checkpoint wire profile shared with TypeScript.
+// Unlike persisted backend times, checkpoint timestamps retain sub-millisecond
+// precision and omit an all-zero fraction.
+func formatTimestamp(value time.Time) (string, error) {
+	value = value.UTC()
+	if value.Year() < 0 || value.Year() > 9999 {
+		return "", fmt.Errorf("invalid checkpoint timestamp")
+	}
+	return value.Format(time.RFC3339Nano), nil
 }
 
 // Digest returns the SHA-256 digest of the canonical signing body.
@@ -410,10 +425,14 @@ func encodeWireClaims(payload Payload, newPeaks, prevPeaks [][]byte, proof *mmr.
 			return nil, err
 		}
 	}
+	timestamp, err := formatTimestamp(payload.Timestamp)
+	if err != nil {
+		return nil, err
+	}
 	claims := wireClaims{
 		Kind: wireKind, LogSize: payload.MMRSize, Commitment: newCommitment,
 		PrevSize: payload.PrevSize, PrevCommitment: previousCommitment,
-		IssuedAt: payload.Timestamp.UTC().Format(time.RFC3339Nano),
+		IssuedAt: timestamp,
 	}
 	if proof != nil {
 		claims.ConsistencyProof = &wireConsistencyProof{
