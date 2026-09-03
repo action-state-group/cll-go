@@ -6,7 +6,7 @@
 external-witness primitives, plus an AAC format-4 ledger binding with
 independent Producer Envelope persistence.
 
-Go module: `github.com/ethanyzhang/cll-go`.
+Go module: `github.com/action-state-group/cll-go`.
 
 ## Source grounding
 

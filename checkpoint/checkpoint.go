@@ -13,8 +13,8 @@ import (
 	"time"
 
 	"github.com/action-state-group/agent-action-capsule/go/canonical"
-	"github.com/ethanyzhang/cll-go/ledger"
-	"github.com/ethanyzhang/cll-go/mmr"
+	"github.com/action-state-group/cll-go/ledger"
+	"github.com/action-state-group/cll-go/mmr"
 	"github.com/fxamacker/cbor/v2"
 	"github.com/veraison/go-cose"
 )

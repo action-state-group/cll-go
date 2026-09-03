@@ -12,9 +12,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ethanyzhang/cll-go/cll"
-	"github.com/ethanyzhang/cll-go/ledger"
-	"github.com/ethanyzhang/cll-go/mmr"
+	"github.com/action-state-group/cll-go/cll"
+	"github.com/action-state-group/cll-go/ledger"
+	"github.com/action-state-group/cll-go/mmr"
 	sqliteDriver "modernc.org/sqlite"
 )
 

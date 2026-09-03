@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ethanyzhang/cll-go/internal/storetest"
-	"github.com/ethanyzhang/cll-go/ledger"
+	"github.com/action-state-group/cll-go/internal/storetest"
+	"github.com/action-state-group/cll-go/ledger"
 	"github.com/stretchr/testify/require"
 )
 

@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ethanyzhang/cll-go/checkpoint"
+	"github.com/action-state-group/cll-go/checkpoint"
 	"github.com/stretchr/testify/require"
 )
 

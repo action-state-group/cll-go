@@ -5,7 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 
-	"github.com/ethanyzhang/cll-go/cll"
+	"github.com/action-state-group/cll-go/cll"
 )
 
 // ProjectCLLEntries decodes verified AAC Capsule IDs into the generic CLL leaf

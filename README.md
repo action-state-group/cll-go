@@ -29,8 +29,8 @@ independently verified ledger associations and do not create CLL leaves.
 The end-to-end integration uses both the producer and ledger modules:
 
 ```sh
-go get github.com/ethanyzhang/capsule-emit-go@latest
-go get github.com/ethanyzhang/cll-go@latest
+go get github.com/action-state-group/capsule-emit-go@latest
+go get github.com/action-state-group/cll-go@latest
 ```
 
 ## Storage
@@ -68,12 +68,12 @@ import (
     "fmt"
     "time"
 
-    "github.com/ethanyzhang/capsule-emit-go"
+    "github.com/action-state-group/capsule-emit-go"
 
-    "github.com/ethanyzhang/cll-go/capsuleanchor"
-    "github.com/ethanyzhang/cll-go/checkpoint"
-    "github.com/ethanyzhang/cll-go/ledger"
-    "github.com/ethanyzhang/cll-go/store/sqlite"
+    "github.com/action-state-group/cll-go/capsuleanchor"
+    "github.com/action-state-group/cll-go/checkpoint"
+    "github.com/action-state-group/cll-go/ledger"
+    "github.com/action-state-group/cll-go/store/sqlite"
 )
 
 func PublishInvestigation(

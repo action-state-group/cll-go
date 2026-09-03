@@ -10,10 +10,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ethanyzhang/cll-go/checkpoint"
-	"github.com/ethanyzhang/cll-go/cll"
-	"github.com/ethanyzhang/cll-go/ledger"
-	"github.com/ethanyzhang/cll-go/store/jsonl"
+	"github.com/action-state-group/cll-go/checkpoint"
+	"github.com/action-state-group/cll-go/cll"
+	"github.com/action-state-group/cll-go/ledger"
+	"github.com/action-state-group/cll-go/store/jsonl"
 	"github.com/stretchr/testify/require"
 )
 

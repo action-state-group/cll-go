@@ -15,7 +15,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ethanyzhang/cll-go/checkpoint"
+	"github.com/action-state-group/cll-go/checkpoint"
 )
 
 // DefaultMaxResponseBytes bounds a witness response to one MiB.

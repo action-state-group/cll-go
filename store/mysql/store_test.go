@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ethanyzhang/cll-go/internal/storetest"
-	"github.com/ethanyzhang/cll-go/ledger"
+	"github.com/action-state-group/cll-go/internal/storetest"
+	"github.com/action-state-group/cll-go/ledger"
 	mysqlDriver "github.com/go-sql-driver/mysql"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"

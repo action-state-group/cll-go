@@ -8,7 +8,7 @@ import (
 	"math/rand/v2"
 	"time"
 
-	"github.com/ethanyzhang/cll-go/ledger"
+	"github.com/action-state-group/cll-go/ledger"
 )
 
 // Submitter sends a signed checkpoint to one witness.

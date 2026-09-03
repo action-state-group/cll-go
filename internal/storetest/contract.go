@@ -14,8 +14,8 @@ import (
 
 	"github.com/action-state-group/agent-action-capsule/go/canonical"
 	aacverify "github.com/action-state-group/agent-action-capsule/go/verify"
-	"github.com/ethanyzhang/capsule-emit-go"
-	"github.com/ethanyzhang/cll-go/ledger"
+	"github.com/action-state-group/capsule-emit-go"
+	"github.com/action-state-group/cll-go/ledger"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
