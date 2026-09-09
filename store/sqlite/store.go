@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"path/filepath"
 	"sync"
 	"time"
@@ -65,8 +66,24 @@ type Store struct {
 	closed    bool
 }
 
-// Open opens one logical log in a SQLite database.
+// Open validates an existing logical log without schema or metadata writes.
+// Provision the database and log explicitly with Init before runtime use.
 func Open(path, logID string) (*Store, error) {
+	return open(path, logID, false)
+}
+
+// Init provisions the SQLite schema and logical log explicitly. It preserves
+// existing entries and may be retried after a partial initialization failure.
+func Init(path, logID string) error {
+	store, err := open(path, logID, true)
+	if err != nil {
+		return err
+	}
+	return store.Close()
+}
+
+func open(path, logID string, initialize bool) (*Store, error) {
+
 	if path == "" || cll.ValidateIdentifier(logID) != nil {
 		return nil, fmt.Errorf("%w: database path and log ID are required", cll.ErrInvalid)
 	}
@@ -78,27 +95,37 @@ func Open(path, logID string) (*Store, error) {
 	lock := acquireShared(key)
 	lock.mu.Lock()
 	defer lock.mu.Unlock()
-	db, err := sql.Open("sqlite", path)
+	mode := "rw"
+	if initialize {
+		mode = "rwc"
+	}
+	uri := url.URL{Scheme: "file", Path: absolute, RawQuery: "mode=" + mode}
+	db, err := sql.Open("sqlite", uri.String())
 	if err != nil {
 		releaseShared(key)
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
 	store := &Store{db: db, logID: logID, lockKey: key, shared: lock}
-	for _, pragma := range []string{"PRAGMA journal_mode=WAL", "PRAGMA foreign_keys=ON", "PRAGMA busy_timeout=5000"} {
+	for _, pragma := range []string{"PRAGMA foreign_keys=ON", "PRAGMA busy_timeout=5000"} {
 		if _, err := db.Exec(pragma); err != nil {
 			return nil, closeOpenFailure(db, key, classify(err))
 		}
 	}
-	if _, err := db.Exec(schema); err != nil {
-		return nil, closeOpenFailure(db, key, classify(err))
-	}
-	empty, err := backend.MarshalMetadata(cll.State{})
-	if err != nil {
-		return nil, closeOpenFailure(db, key, err)
-	}
-	if _, err := db.Exec("INSERT OR IGNORE INTO cll_meta(log_id,state) VALUES(?,?)", logID, empty); err != nil {
-		return nil, closeOpenFailure(db, key, classify(err))
+	if initialize {
+		if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
+			return nil, closeOpenFailure(db, key, classify(err))
+		}
+		if _, err := db.Exec(schema); err != nil {
+			return nil, closeOpenFailure(db, key, classify(err))
+		}
+		empty, err := backend.MarshalMetadata(cll.State{})
+		if err != nil {
+			return nil, closeOpenFailure(db, key, err)
+		}
+		if _, err := db.Exec("INSERT OR IGNORE INTO cll_meta(log_id,state) VALUES(?,?)", logID, empty); err != nil {
+			return nil, closeOpenFailure(db, key, classify(err))
+		}
 	}
 	if err := validateOpenState(context.Background(), db, logID); err != nil {
 		return nil, closeOpenFailure(db, key, err)

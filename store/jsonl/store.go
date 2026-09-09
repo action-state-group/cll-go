@@ -39,13 +39,29 @@ type Store struct {
 	closed bool
 }
 
-// Open opens or creates path and takes a non-blocking exclusive lock on the
-// journal descriptor. A final incomplete line is treated as a torn write.
+// Open validates an existing journal under a non-blocking exclusive writer
+// lock. Missing initialization or a torn tail is rejected without file writes.
 func Open(path string) (*Store, error) {
+	return open(path, false)
+}
+
+// Init creates the format header for a new journal. For an existing journal it
+// validates state and repairs only an incomplete final line, under writer lock.
+// Complete corrupt records are never removed. Repeated Init is idempotent.
+func Init(path string) error {
+	store, err := open(path, true)
+	if err != nil {
+		return err
+	}
+	return store.Close()
+}
+
+func open(path string, initialize bool) (*Store, error) {
+
 	if path == "" {
 		return nil, fmt.Errorf("%w: journal path is required", cll.ErrInvalid)
 	}
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o640)
+	file, err := os.OpenFile(path, journalFlags(initialize), 0o640)
 	if err != nil {
 		return nil, fmt.Errorf("open JSONL journal: %w", err)
 	}
@@ -56,7 +72,7 @@ func Open(path string) (*Store, error) {
 		)
 	}
 	store := &Store{file: file, engine: backend.New()}
-	if err := store.replay(); err != nil {
+	if err := store.replay(initialize); err != nil {
 		return nil, errors.Join(err, store.closeFile())
 	}
 	info, err := file.Stat()
@@ -64,6 +80,9 @@ func Open(path string) (*Store, error) {
 		return nil, errors.Join(fmt.Errorf("stat JSONL journal: %w", err), store.closeFile())
 	}
 	if info.Size() == 0 {
+		if !initialize {
+			return nil, errors.Join(fmt.Errorf("%w: missing JSONL initialization; call Init", cll.ErrCorrupt), store.closeFile())
+		}
 		if err := store.appendEvent(event{Version: schemaVersion, Type: "cll.init"}); err != nil {
 			return nil, errors.Join(err, store.closeFile())
 		}
@@ -71,7 +90,15 @@ func Open(path string) (*Store, error) {
 	return store, nil
 }
 
-func (s *Store) replay() error {
+// journalFlags prevents Open from creating a missing file.
+func journalFlags(initialize bool) int {
+	if initialize {
+		return os.O_CREATE | os.O_RDWR
+	}
+	return os.O_RDWR
+}
+
+func (s *Store) replay(repair bool) error {
 	data, err := io.ReadAll(s.file)
 	if err != nil {
 		return fmt.Errorf("read JSONL journal: %w", err)
@@ -120,6 +147,9 @@ func (s *Store) replay() error {
 		start = end + 1
 	}
 	if validEnd != len(data) {
+		if !repair {
+			return fmt.Errorf("%w: incomplete JSONL tail; call Init to recover", cll.ErrCorrupt)
+		}
 		if err := s.file.Truncate(int64(validEnd)); err != nil {
 			return fmt.Errorf("truncate torn JSONL tail: %w", err)
 		}

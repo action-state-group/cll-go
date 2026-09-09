@@ -53,8 +53,54 @@ type Store struct {
 	closed    bool
 }
 
-// Open opens one logical log and initializes the shared four-table schema.
+// Init explicitly provisions the shared MySQL schema and an empty logical log.
+// Existing records are preserved. MySQL DDL is not transactional, so retrying
+// Init after a partial failure is supported. Runtime readers should use Open.
+func Init(ctx context.Context, dsn, logID string) (err error) {
+	db, err := openDatabase(ctx, dsn, logID)
+	if err != nil {
+		return err
+	}
+	defer func() { err = errors.Join(err, db.Close()) }()
+	for _, statement := range schemaStatements {
+		if _, err := db.ExecContext(ctx, statement); err != nil {
+			return classify(err)
+		}
+	}
+	empty, err := backend.MarshalMetadata(cll.State{})
+	if err != nil {
+		return err
+	}
+	if _, err := db.ExecContext(ctx, "INSERT IGNORE INTO cll_meta(log_id,state) VALUES(?,?)", logID, empty); err != nil {
+		return classify(err)
+	}
+	if err := validateEntries(ctx, db, logID); err != nil {
+		return err
+	}
+	store := &Store{db: db, logID: logID}
+	return store.readState(ctx, func(cll.State) error { return nil })
+}
+
+// Open opens and validates an existing logical log without DDL or data writes.
+// An absent schema or log is an error; provision it with Init first. SELECT-only
+// credentials suffice for reads. Mutating methods need separate SQL grants.
 func Open(ctx context.Context, dsn, logID string) (*Store, error) {
+	db, err := openDatabase(ctx, dsn, logID)
+	if err != nil {
+		return nil, err
+	}
+	store := &Store{db: db, logID: logID}
+	if err := validateEntries(ctx, db, logID); err != nil {
+		return nil, errors.Join(err, db.Close())
+	}
+	if err := store.readState(ctx, func(cll.State) error { return nil }); err != nil {
+		return nil, errors.Join(err, db.Close())
+	}
+	return store, nil
+}
+
+// openDatabase owns connection validation but never initializes stored state.
+func openDatabase(ctx context.Context, dsn, logID string) (*sql.DB, error) {
 	if dsn == "" || cll.ValidateIdentifier(logID) != nil {
 		return nil, fmt.Errorf("%w: DSN and log ID are required", cll.ErrInvalid)
 	}
@@ -65,26 +111,7 @@ func Open(ctx context.Context, dsn, logID string) (*Store, error) {
 	if err := db.PingContext(ctx); err != nil {
 		return nil, errors.Join(err, db.Close())
 	}
-	for _, statement := range schemaStatements {
-		if _, err := db.ExecContext(ctx, statement); err != nil {
-			return nil, errors.Join(classify(err), db.Close())
-		}
-	}
-	empty, err := backend.MarshalMetadata(cll.State{})
-	if err != nil {
-		return nil, errors.Join(err, db.Close())
-	}
-	if _, err := db.ExecContext(ctx, "INSERT IGNORE INTO cll_meta(log_id,state) VALUES(?,?)", logID, empty); err != nil {
-		return nil, errors.Join(classify(err), db.Close())
-	}
-	store := &Store{db: db, logID: logID}
-	if err := validateEntries(ctx, db, logID); err != nil {
-		return nil, errors.Join(err, db.Close())
-	}
-	if err := store.readState(ctx, func(cll.State) error { return nil }); err != nil {
-		return nil, errors.Join(err, db.Close())
-	}
-	return store, nil
+	return db, nil
 }
 
 type queryer interface {

@@ -33,6 +33,21 @@ func run(ctx context.Context, args []string) (runErr error) {
 		return fmt.Errorf("usage: storage <advance|verify|hold|expect-contention> <jsonl|sqlite|mysql> <target> <log-id> [argument]")
 	}
 	mode, backendName, target, logID := args[0], args[1], args[2], args[3]
+	if mode == "advance" || mode == "hold" {
+		var err error
+		switch backendName {
+		case "mysql":
+			err = mysql.Init(ctx, target, logID)
+		case "sqlite":
+			err = sqlite.Init(target, logID)
+		case "jsonl":
+			err = jsonl.Init(target)
+		}
+		if err != nil {
+			return err
+		}
+	}
+
 	if mode == "expect-contention" {
 		store, err := openBackend(ctx, backendName, target, logID)
 		if err == nil {

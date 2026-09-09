@@ -14,6 +14,7 @@ import (
 
 func TestContractAndReopen(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "cll.sqlite")
+	require.NoError(t, Init(path, "default"))
 	store, err := Open(path, "default")
 	require.NoError(t, err)
 	storetest.Run(t, store)
@@ -27,6 +28,7 @@ func TestContractAndReopen(t *testing.T) {
 
 func TestCrossHandleDenseSequences(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "cll.sqlite")
+	require.NoError(t, Init(path, "shared"))
 	first, err := Open(path, "shared")
 	require.NoError(t, err)
 	second, err := Open(path, "shared")
@@ -40,6 +42,7 @@ func TestCrossHandleDenseSequences(t *testing.T) {
 
 func TestReadUsesStableSnapshotAcrossExternalWriter(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "snapshot.sqlite")
+	require.NoError(t, Init(path, "snapshot"))
 	store, err := Open(path, "snapshot")
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, store.Close()) })
@@ -79,6 +82,9 @@ func TestApplicationTableCoexistence(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, db.Close()) })
 	storetest.SQLApplicationTableCoexistence(t, db, func(logID string) (cll.Backend, error) {
+		if err := Init(path, logID); err != nil {
+			return nil, err
+		}
 		return Open(path, logID)
 	})
 }

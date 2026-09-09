@@ -18,10 +18,12 @@ import (
 func TestContractAndCrossHandle(t *testing.T) {
 	dsn, terminate := startMySQL(t)
 	t.Cleanup(terminate)
+	require.NoError(t, Init(t.Context(), dsn, "contract"))
 	store, err := Open(t.Context(), dsn, "contract")
 	require.NoError(t, err)
 	storetest.Run(t, store)
 
+	require.NoError(t, Init(t.Context(), dsn, "shared"))
 	first, err := Open(t.Context(), dsn, "shared")
 	require.NoError(t, err)
 	second, err := Open(t.Context(), dsn, "shared")
@@ -40,6 +42,9 @@ func TestApplicationTableCoexistence(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, db.Close()) })
 	storetest.SQLApplicationTableCoexistence(t, db, func(logID string) (cll.Backend, error) {
+		if err := Init(t.Context(), dsn, logID); err != nil {
+			return nil, err
+		}
 		return Open(t.Context(), dsn, logID)
 	})
 }

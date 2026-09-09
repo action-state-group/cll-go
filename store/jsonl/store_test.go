@@ -17,6 +17,7 @@ import (
 
 func TestContractAndReopen(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "cll.jsonl")
+	require.NoError(t, Init(path))
 	store, err := Open(path)
 	require.NoError(t, err)
 	storetest.Run(t, store)
@@ -34,6 +35,7 @@ func TestContractAndReopen(t *testing.T) {
 
 func TestWriterLockAndTornTail(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "cll.jsonl")
+	require.NoError(t, Init(path))
 	first, err := Open(path)
 	require.NoError(t, err)
 	_, err = Open(path)
@@ -45,6 +47,9 @@ func TestWriterLockAndTornTail(t *testing.T) {
 	_, err = file.WriteString("{torn")
 	require.NoError(t, err)
 	require.NoError(t, file.Close())
+	_, err = Open(path)
+	require.ErrorIs(t, err, cll.ErrCorrupt)
+	require.NoError(t, Init(path))
 	reopened, err := Open(path)
 	require.NoError(t, err)
 	require.NoError(t, reopened.Close())
@@ -70,6 +75,7 @@ func TestRejectsLegacyAndCompleteCorruption(t *testing.T) {
 
 func TestCLLCommitStoresOnlyNodeDelta(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "cll.jsonl")
+	require.NoError(t, Init(path))
 	store, err := Open(path)
 	require.NoError(t, err)
 	nodes := make([][]byte, 127)
@@ -89,6 +95,7 @@ func TestCLLCommitStoresOnlyNodeDelta(t *testing.T) {
 
 func TestReplayManyCLLCommitDeltas(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "cll.jsonl")
+	require.NoError(t, Init(path))
 	store, err := Open(path)
 	require.NoError(t, err)
 	tree, err := mmr.New(nil)

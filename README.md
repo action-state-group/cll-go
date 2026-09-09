@@ -68,6 +68,12 @@ The same `cll.Backend` contract is implemented by:
 
 ```go
 memoryStore := memory.New()
+// Provision explicitly during setup; check each initialization error.
+if err := jsonl.Init("./cll.jsonl"); err != nil { return err }
+if err := sqlite.Init("./cll.sqlite", "default"); err != nil { return err }
+if err := mysql.Init(ctx, dsn, "default"); err != nil { return err }
+
+// Runtime opens never create schema, log metadata, or a journal header.
 jsonlStore, err := jsonl.Open("./cll.jsonl")
 sqliteStore, err := sqlite.Open("./cll.sqlite", "default")
 mysqlStore, err := mysql.Open(ctx, dsn, "default")
@@ -100,12 +106,14 @@ metadata, timestamps, decimal counters, base64 values, and witness JSON use the
 same portable encodings in both runtimes. See [DESIGN.md](DESIGN.md) for the
 exact DDL and transition contract.
 
-SQL backends ignore application-owned tables, including pre-1.0 tables, and
-initialize only the generic `cll_*` schema and requested log. A new log starts
-empty; opening it does not import old records or prove migration is complete.
-Applications own migration and checkpoint continuity. Actual incompatible CLL
-tables or corrupt requested-log state still fail to open. A failed open may
-leave newly initialized CLL tables; it does not migrate application tables.
+SQL backends ignore application-owned tables. `Init` provisions only the generic
+`cll_*` schema and requested log. A new log starts empty; initialization does not
+import old records or prove migration complete. `Open` requires an existing log
+and validates its state without DDL or metadata insertion. Initialization may
+leave created tables after a failure and can be retried without deleting data.
+This is a breaking lifecycle change: callers that provision storage must call
+`Init` explicitly; read and write runtime paths call only `Open`.
+
 
 ### JSONL format
 

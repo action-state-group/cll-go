@@ -82,6 +82,9 @@ Backend constructors are:
 
 ```go
 memory.New() *memory.Store
+jsonl.Init(path string) error
+sqlite.Init(path, logID string) error
+mysql.Init(ctx context.Context, dsn, logID string) error
 jsonl.Open(path string) (*jsonl.Store, error)
 sqlite.Open(path, logID string) (*sqlite.Store, error)
 mysql.Open(ctx context.Context, dsn, logID string) (*mysql.Store, error)
@@ -345,8 +348,7 @@ The writer acquires a non-blocking exclusive lock on the journal file
 descriptor itself. A sidecar lock is not interoperable because the TypeScript
 writer locks the journal descriptor. It records and fsyncs the complete event
 before considering the mutation durable. A failed write is truncated back to
-the previous durable offset and fsynced. On open, a final
-non-newline-terminated tail is truncated; malformed complete lines are
+the previous durable offset and fsynced. Explicit `jsonl.Init` truncates an incomplete final tail; `Open` rejects it without modifying the journal; malformed complete lines are
 corruption. A version 3 journal is rejected explicitly.
 
 On a new empty file the writer emits `cll.init` exactly once. On an existing
@@ -469,14 +471,14 @@ different JSONL v3 event family and SQL schema. It cannot be opened as the
 generic format.
 
 - JSONL rejects version 3 and names it as unsupported legacy data.
-- SQLite and MySQL initialize the shared `cll_*` tables and validate the
+- Explicit SQLite and MySQL `Init` calls initialize the shared `cll_*` tables and validate the
   requested log. Application-owned tables, including `ledger_metadata` and
   `schema_metadata`, may coexist and do not classify a database as a CLL
   format. Opening a log neither reads nor migrates those tables.
 - An incompatible `cll_*` schema or corrupt requested-log state remains an
   error. Existing log entries, commitments and witness state are not reset
   when another log is initialized.
-- Opening a new log creates empty generic state, not imported application
+- Initializing a new log creates empty generic state, not imported application
   history. Hosts must verify migration completeness and checkpoint continuity;
   backend initialization does not establish either. Failed initialization may
   leave CLL tables already created before validation fails.
@@ -638,3 +640,14 @@ Independent GitHub checks should remain parallel:
 `capsule-emit-go` keeps its existing independent quality, coverage, race, and
 Python/TypeScript interoperability checks. Its documentation change must not
 alter its dependency graph or wire vectors.
+
+### Explicit persistent-store lifecycle
+
+All persistent backends expose package-level `Init` and `Open` functions; these
+are constructors, not methods on `cll.Backend`. `Open` requires existing state
+and never creates tables, metadata, files, or JSONL headers. MySQL readers can
+use SELECT-only credentials. SQLite connection-local settings and JSONL writer
+locks remain in `Open`; they do not initialize log contents. `Init` is idempotent
+and owns provisioning (including SQLite WAL configuration). JSONL `Init` is
+not a no-op: it creates the `cll.init` header and explicitly repairs torn tails.
+Complete corrupt records are rejected. The in-memory backend retains `New()`.
