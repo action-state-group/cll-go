@@ -73,24 +73,12 @@ func TestReadUsesStableSnapshotAcrossExternalWriter(t *testing.T) {
 	require.Equal(t, 1, after)
 }
 
-func TestSchemaAndLegacyDetection(t *testing.T) {
+func TestApplicationTableCoexistence(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "cll.sqlite")
 	db, err := sql.Open("sqlite", path)
 	require.NoError(t, err)
-	_, err = db.Exec("CREATE TABLE ledger_metadata(id INTEGER)")
-	require.NoError(t, err)
-	require.NoError(t, db.Close())
-	store, err := Open(path, "default")
-	require.Nil(t, store)
-	require.ErrorIs(t, err, cll.ErrCorrupt)
-
-	genericPath := filepath.Join(t.TempDir(), "generic.sqlite")
-	db, err = sql.Open("sqlite", genericPath)
-	require.NoError(t, err)
-	_, err = db.Exec("CREATE TABLE schema_metadata(singleton INTEGER, version INTEGER); CREATE TABLE capsules(id TEXT)")
-	require.NoError(t, err)
-	require.NoError(t, db.Close())
-	store, err = Open(genericPath, "default")
-	require.NoError(t, err)
-	require.NoError(t, store.Close())
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	storetest.SQLApplicationTableCoexistence(t, db, func(logID string) (cll.Backend, error) {
+		return Open(path, logID)
+	})
 }

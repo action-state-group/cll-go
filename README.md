@@ -100,9 +100,12 @@ metadata, timestamps, decimal counters, base64 values, and witness JSON use the
 same portable encodings in both runtimes. See [DESIGN.md](DESIGN.md) for the
 exact DDL and transition contract.
 
-The current generic schema intentionally refuses the identifiable pre-1.0
-application-specific schema. Applications must migrate their business records
-and initialize a fresh generic CLL explicitly.
+SQL backends ignore application-owned tables, including pre-1.0 tables, and
+initialize only the generic `cll_*` schema and requested log. A new log starts
+empty; opening it does not import old records or prove migration is complete.
+Applications own migration and checkpoint continuity. Actual incompatible CLL
+tables or corrupt requested-log state still fail to open. A failed open may
+leave newly initialized CLL tables; it does not migrate application tables.
 
 ### JSONL format
 
@@ -221,7 +224,8 @@ For a backend contributed to this repository, reuse `internal/backend` for
 portable encoding and state transitions, then run `internal/storetest.Run` in
 its tests. Persistent multi-handle backends should also run
 `internal/storetest.CrossHandle`. Backend-specific tests must cover reopen,
-corruption or legacy-format refusal, and crash recovery.
+corruption and unsupported CLL formats, application-table coexistence for SQL
+backends, and crash recovery.
 
 ## Continuous integration
 

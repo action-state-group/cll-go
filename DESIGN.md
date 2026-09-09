@@ -469,16 +469,17 @@ different JSONL v3 event family and SQL schema. It cannot be opened as the
 generic format.
 
 - JSONL rejects version 3 and names it as unsupported legacy data.
-- SQLite and MySQL inspect the existing table set before creating `cll_*`
-  tables. Presence of the distinctive `ledger_metadata` table identifies the
-  old or partially old format and fails closed. If
-  `schema_metadata(singleton, version)` also exists, version 3 is diagnostic
-  corroboration only; it is never sufficient by itself because that table name
-  and version are application-generic.
-- A legacy match returns `ErrCorrupt` with a migration-required message and
-  leaves the database unchanged. A lone generic table such as
-  `schema_metadata`, `capsules`, or `checkpoints` does not classify the
-  database as the old CLL format.
+- SQLite and MySQL initialize the shared `cll_*` tables and validate the
+  requested log. Application-owned tables, including `ledger_metadata` and
+  `schema_metadata`, may coexist and do not classify a database as a CLL
+  format. Opening a log neither reads nor migrates those tables.
+- An incompatible `cll_*` schema or corrupt requested-log state remains an
+  error. Existing log entries, commitments and witness state are not reset
+  when another log is initialized.
+- Opening a new log creates empty generic state, not imported application
+  history. Hosts must verify migration completeness and checkpoint continuity;
+  backend initialization does not establish either. Failed initialization may
+  leave CLL tables already created before validation fails.
 - No compatibility alias, automatic copy, or dual-write path remains in
   `cll-go`.
 
@@ -571,9 +572,9 @@ The same Go test suite runs against Memory, JSONL, SQLite, and MySQL and covers:
 - exact `cll.init` emission/replay behavior;
 - SQLite two-handle success under concurrent append, including bounded busy
   waiting rather than treating immediate `SQLITE_BUSY` as the expected result;
-- legacy JSONL v3 rejection, positive and partial legacy SQL detection without
-  writes, and negative cases where one common application table must not block
-  a new generic log.
+- unsupported JSONL v3 rejection, application-table coexistence without
+  changing existing log or application rows, and fail-closed validation of
+  actual CLL metadata and table shapes.
 
 ### Cross-runtime storage
 

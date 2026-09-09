@@ -90,13 +90,6 @@ func Open(path, logID string) (*Store, error) {
 			return nil, closeOpenFailure(db, key, classify(err))
 		}
 	}
-	legacy, err := sqliteTableExists(context.Background(), db, "ledger_metadata")
-	if err != nil {
-		return nil, closeOpenFailure(db, key, classify(err))
-	}
-	if legacy {
-		return nil, closeOpenFailure(db, key, fmt.Errorf("%w: legacy application storage requires application-owned migration", cll.ErrCorrupt))
-	}
 	if _, err := db.Exec(schema); err != nil {
 		return nil, closeOpenFailure(db, key, classify(err))
 	}
@@ -158,15 +151,6 @@ type queryer interface {
 	ExecContext(context.Context, string, ...any) (sql.Result, error)
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 	QueryRowContext(context.Context, string, ...any) *sql.Row
-}
-
-func sqliteTableExists(ctx context.Context, q queryer, name string) (bool, error) {
-	var found int
-	err := q.QueryRowContext(ctx, "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", name).Scan(&found)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	}
-	return err == nil, err
 }
 
 func (s *Store) withRead(ctx context.Context, operation func(queryer) error) error {

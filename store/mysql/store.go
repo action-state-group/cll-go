@@ -65,16 +65,6 @@ func Open(ctx context.Context, dsn, logID string) (*Store, error) {
 	if err := db.PingContext(ctx); err != nil {
 		return nil, errors.Join(err, db.Close())
 	}
-	legacy, err := mysqlTableExists(ctx, db, "ledger_metadata")
-	if err != nil {
-		return nil, errors.Join(classify(err), db.Close())
-	}
-	if legacy {
-		return nil, errors.Join(
-			fmt.Errorf("%w: legacy application storage requires application-owned migration", cll.ErrCorrupt),
-			db.Close(),
-		)
-	}
 	for _, statement := range schemaStatements {
 		if _, err := db.ExecContext(ctx, statement); err != nil {
 			return nil, errors.Join(classify(err), db.Close())
@@ -101,12 +91,6 @@ type queryer interface {
 	ExecContext(context.Context, string, ...any) (sql.Result, error)
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 	QueryRowContext(context.Context, string, ...any) *sql.Row
-}
-
-func mysqlTableExists(ctx context.Context, q queryer, name string) (bool, error) {
-	var count int
-	err := q.QueryRowContext(ctx, "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name=?", name).Scan(&count)
-	return count > 0, err
 }
 
 func validateEntries(ctx context.Context, q queryer, logID string) (resultErr error) {

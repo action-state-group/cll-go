@@ -33,17 +33,15 @@ func TestContractAndCrossHandle(t *testing.T) {
 	storetest.CrossHandle(t, first, second)
 }
 
-func TestLegacyDetection(t *testing.T) {
+func TestApplicationTableCoexistence(t *testing.T) {
 	dsn, terminate := startMySQL(t)
 	t.Cleanup(terminate)
 	db, err := sql.Open("mysql", dsn)
 	require.NoError(t, err)
-	_, err = db.ExecContext(t.Context(), "CREATE TABLE ledger_metadata(id INT)")
-	require.NoError(t, err)
-	require.NoError(t, db.Close())
-	store, err := Open(t.Context(), dsn, "default")
-	require.Nil(t, store)
-	require.ErrorIs(t, err, cll.ErrCorrupt)
+	t.Cleanup(func() { require.NoError(t, db.Close()) })
+	storetest.SQLApplicationTableCoexistence(t, db, func(logID string) (cll.Backend, error) {
+		return Open(t.Context(), dsn, logID)
+	})
 }
 
 func TestClassifyContention(t *testing.T) {
