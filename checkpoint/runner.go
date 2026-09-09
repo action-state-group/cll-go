@@ -282,6 +282,8 @@ func (r *Runner) catchUp(ctx context.Context, now time.Time) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	var err error
+	// now is pinned for the entire catch-up loop so every checkpoint emitted
+	// in this pass shares one consistent evaluation time.
 	now, err = normalizeRunnerTime(now)
 	if err != nil {
 		return err

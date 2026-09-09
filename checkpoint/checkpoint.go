@@ -549,20 +549,19 @@ func protectedCWTClaims(value any) (cose.CWTClaims, error) {
 	}
 }
 
-// Config defines entry, age, and overdue checkpoint thresholds.
+// Config defines the entry-count and age checkpoint cadence thresholds.
 type Config struct {
 	CadenceEntries uint64
 	CadenceAge     time.Duration
-	MaxLagEntries  uint64
 }
 
-// DefaultConfig returns 100 entries, 15 minutes, and over-200 overdue.
+// DefaultConfig returns 100 entries and 15 minutes.
 func DefaultConfig() Config {
-	return Config{CadenceEntries: 100, CadenceAge: 15 * time.Minute, MaxLagEntries: 200}
+	return Config{CadenceEntries: 100, CadenceAge: 15 * time.Minute}
 }
 
 func (c Config) Validate() error {
-	if c.CadenceEntries == 0 || c.CadenceAge <= 0 || c.MaxLagEntries < c.CadenceEntries {
+	if c.CadenceEntries == 0 || c.CadenceAge <= 0 {
 		return fmt.Errorf("invalid checkpoint cadence")
 	}
 	return nil
@@ -574,5 +573,3 @@ func (c Config) Due(entries uint64, firstUncheckpointed, now time.Time) bool {
 	}
 	return entries >= c.CadenceEntries || !firstUncheckpointed.IsZero() && now.Sub(firstUncheckpointed) >= c.CadenceAge
 }
-
-func (c Config) Overdue(entries uint64) bool { return entries > c.MaxLagEntries }

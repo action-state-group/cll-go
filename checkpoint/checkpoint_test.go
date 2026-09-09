@@ -273,6 +273,4 @@ func TestCadenceBoundaries(t *testing.T) {
 	require.False(t, config.Due(0, now.Add(-time.Hour), now))
 	require.True(t, config.Due(100, now, now))
 	require.True(t, config.Due(1, now.Add(-15*time.Minute), now))
-	require.False(t, config.Overdue(200))
-	require.True(t, config.Overdue(201))
 }

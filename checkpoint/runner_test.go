@@ -126,11 +126,11 @@ func runnerFixture(t *testing.T) (*memory.Store, *checkpoint.Ed25519Signer) {
 	return store, signer
 }
 
-func appendEntries(t *testing.T, store cll.EntryStore, started time.Time, count int) {
+func appendEntries(t *testing.T, store cll.Backend, started time.Time, count int) {
 	appendEntriesFrom(t, store, started, 1, count)
 }
 
-func appendEntriesFrom(t *testing.T, store cll.EntryStore, started time.Time, start, count int) {
+func appendEntriesFrom(t *testing.T, store cll.Backend, started time.Time, start, count int) {
 	t.Helper()
 	for number := start; number < start+count; number++ {
 		_, err := store.Append(t.Context(), cll.AppendInput{Value: bytes.Repeat([]byte{byte(number)}, cll.EntryBytes), AppendedAt: started.Add(time.Duration(number-start) * time.Second)})

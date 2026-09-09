@@ -165,12 +165,6 @@ type EntrySource interface {
     ScanEntries(context.Context, uint64, int) ([]Entry, error)
 }
 
-type EntryStore interface {
-    EntrySource
-    Append(context.Context, AppendInput) (AppendResult, error)
-    GetEntry(context.Context, []byte) (Entry, error)
-}
-
 type CheckpointStateStore interface {
     LoadCLL(context.Context) (State, error)
     CommitCLL(context.Context, uint64, []byte, State) error
@@ -189,7 +183,9 @@ type CheckpointStore interface {
 }
 
 type Backend interface {
-    EntryStore
+    EntrySource
+    Append(context.Context, AppendInput) (AppendResult, error)
+    GetEntry(context.Context, []byte) (Entry, error)
     CheckpointStateStore
     WitnessStateStore
     Close() error

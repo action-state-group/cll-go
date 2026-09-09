@@ -57,7 +57,6 @@ func Init(path string) error {
 }
 
 func open(path string, initialize bool) (*Store, error) {
-
 	if path == "" {
 		return nil, fmt.Errorf("%w: journal path is required", cll.ErrInvalid)
 	}

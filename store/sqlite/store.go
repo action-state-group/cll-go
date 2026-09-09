@@ -83,7 +83,6 @@ func Init(path, logID string) error {
 }
 
 func open(path, logID string, initialize bool) (*Store, error) {
-
 	if path == "" || cll.ValidateIdentifier(logID) != nil {
 		return nil, fmt.Errorf("%w: database path and log ID are required", cll.ErrInvalid)
 	}

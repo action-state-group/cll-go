@@ -210,7 +210,9 @@ TypeScript-style structural interfaces are expressed as Go interfaces in
 
 ```go
 type Backend interface {
-	EntryStore
+	EntrySource
+	Append(context.Context, AppendInput) (AppendResult, error)
+	GetEntry(context.Context, []byte) (Entry, error)
 	CheckpointStateStore
 	WitnessStateStore
 	Close() error

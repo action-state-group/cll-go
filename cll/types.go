@@ -108,13 +108,6 @@ type EntrySource interface {
 	ScanEntries(context.Context, uint64, int) ([]Entry, error)
 }
 
-// EntryStore appends and retrieves opaque identities.
-type EntryStore interface {
-	EntrySource
-	Append(context.Context, AppendInput) (AppendResult, error)
-	GetEntry(context.Context, []byte) (Entry, error)
-}
-
 // CheckpointStateStore persists append-only CLL state with compare-and-set.
 type CheckpointStateStore interface {
 	LoadCLL(context.Context) (State, error)
@@ -137,7 +130,9 @@ type CheckpointStore interface {
 
 // Backend is the complete generic persistence contract.
 type Backend interface {
-	EntryStore
+	EntrySource
+	Append(context.Context, AppendInput) (AppendResult, error)
+	GetEntry(context.Context, []byte) (Entry, error)
 	CheckpointStateStore
 	WitnessStateStore
 	Close() error
