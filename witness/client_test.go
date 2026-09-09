@@ -5,16 +5,91 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/action-state-group/cll-go/checkpoint"
+	"github.com/action-state-group/cll-go/cll"
+	"github.com/action-state-group/cll-go/store/jsonl"
 	"github.com/stretchr/testify/require"
 )
+
+// TestBoundedWitnessErrorSurvivesDurableReopen proves the end-to-end contract
+// that a misbehaving witness cannot brick reopen. A LastError produced by
+// boundedText from adversarial invalid UTF-8 is committed to a durable JSONL
+// backend, which serializes it through encoding/json. Before the fix, the raw
+// bytes grew past cll.MaxReasonBytes on that round-trip and reopen failed with
+// "cll: corrupt: witness state is invalid". It must now reopen cleanly.
+func TestBoundedWitnessErrorSurvivesDurableReopen(t *testing.T) {
+	ctx := t.Context()
+	at := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	node := bytes.Repeat([]byte{3}, cll.EntryBytes)
+	checkpointBytes := []byte("checkpoint")
+
+	path := filepath.Join(t.TempDir(), "cll.jsonl")
+	require.NoError(t, jsonl.Init(path))
+	store, err := jsonl.Open(path)
+	require.NoError(t, err)
+
+	pending := cll.WitnessState{WitnessID: "primary", CheckpointSize: 1, Checkpoint: checkpointBytes, NextAttemptAt: at}
+	state := cll.State{
+		Size:       1,
+		Nodes:      [][]byte{node},
+		IndexedSeq: 1,
+		Checkpoint: &cll.CheckpointState{Bytes: checkpointBytes, Size: 1, IndexedSeq: 1, Peaks: [][]byte{node}},
+		Witnesses:  []cll.WitnessState{pending},
+	}
+	require.NoError(t, store.CommitCLL(ctx, 0, nil, state))
+
+	row, err := store.GetWitness(ctx, "primary", 1)
+	require.NoError(t, err)
+	failed := failedWitness(row, at, true, strings.Repeat("\xff", cll.MaxReasonBytes), time.Minute)
+	require.LessOrEqual(t, len(failed.LastError), cll.MaxReasonBytes)
+	require.NoError(t, store.CommitWitness(ctx, row.Attempts, failed))
+	require.NoError(t, store.Close())
+
+	reopened, err := jsonl.Open(path)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, reopened.Close()) })
+	restored, err := reopened.GetWitness(ctx, "primary", 1)
+	require.NoError(t, err)
+	require.True(t, utf8.ValidString(restored.LastError))
+	require.LessOrEqual(t, len(restored.LastError), cll.MaxReasonBytes)
+	_, err = reopened.LoadCLL(ctx)
+	require.NoError(t, err)
+}
+
+func TestBoundedTextIsValidUTF8AndWithinCapAcrossJSON(t *testing.T) {
+	cases := map[string]string{
+		"invalid utf8 over cap":  strings.Repeat("\xff", cll.MaxReasonBytes+128),
+		"multibyte split at cap": strings.Repeat("€", cll.MaxReasonBytes/3+1),
+	}
+	for name, input := range cases {
+		t.Run(name, func(t *testing.T) {
+			bounded := boundedText(input)
+			require.True(t, utf8.ValidString(bounded), "output must be valid UTF-8")
+			require.LessOrEqual(t, len(bounded), cll.MaxReasonBytes)
+
+			// A durable JSONL/SQL round-trip serializes LastError through
+			// encoding/json. Valid UTF-8 must survive without growing past the
+			// cap, otherwise reopen validation would reject it.
+			encoded, err := json.Marshal(bounded)
+			require.NoError(t, err)
+			var decoded string
+			require.NoError(t, json.Unmarshal(encoded, &decoded))
+			require.Equal(t, bounded, decoded)
+			require.LessOrEqual(t, len(decoded), cll.MaxReasonBytes)
+		})
+	}
+}
 
 func TestClientUsesCheckpointOnlyEndpoint(t *testing.T) {
 	statement := checkpointStatement(t)

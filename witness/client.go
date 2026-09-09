@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/action-state-group/cll-go/checkpoint"
 	"github.com/action-state-group/cll-go/cll"
@@ -148,11 +149,23 @@ func (c *Client) Submit(ctx context.Context, signedCheckpoint []byte) (Receipt, 
 	return Receipt{Bytes: receiptBytes, EntryHash: wire.EntryHash, EntryHashScheme: wire.EntryHashScheme, LeafIndex: wire.LeafIndex, TreeSize: wire.TreeSize}, nil
 }
 
+// boundedText normalizes operational error text into a form that is stable
+// across a durable JSON round-trip: always valid UTF-8 and never longer than
+// cll.MaxReasonBytes. A remote witness body can contain invalid or mid-rune
+// bytes; encoding/json rewrites invalid UTF-8 to U+FFFD (three bytes each), so
+// a raw byte truncation could grow past the cap after persistence and then
+// fail backend validation on reopen. Normalizing first, then trimming to a
+// rune boundary, keeps len(boundedText(x)) <= cll.MaxReasonBytes after storage.
 func boundedText(value string) string {
+	value = strings.ToValidUTF8(value, "�")
 	if len(value) <= cll.MaxReasonBytes {
 		return value
 	}
-	return value[:cll.MaxReasonBytes]
+	value = value[:cll.MaxReasonBytes]
+	for len(value) > 0 && !utf8.ValidString(value) {
+		value = value[:len(value)-1]
+	}
+	return value
 }
 
 // IsRetryable reports timeout, 408, 429, and 5xx failures.
