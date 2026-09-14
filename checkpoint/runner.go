@@ -190,7 +190,7 @@ func (r *Runner) advanceOnce(ctx context.Context, now time.Time, current *runner
 			payload.PrevSize = state.Checkpoint.Size
 			payload.PrevRoot = previous.Root
 			previousPeaks = state.Checkpoint.Peaks
-			consistency, err := tree.ConsistencyProof(state.Checkpoint.Size)
+			consistency, err := tree.ConsistencyProof(state.Checkpoint.Size, tree.Size())
 			if err != nil {
 				return false, err
 			}

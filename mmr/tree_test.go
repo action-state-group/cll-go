@@ -25,10 +25,10 @@ func TestBaggedInclusionRoundTrip(t *testing.T) {
 	root, err := tree.Root()
 	require.NoError(t, err)
 	for index, id := range ids {
-		proof, err := tree.InclusionProof(uint64(index))
+		proof, err := tree.InclusionProof(uint64(index), tree.Size())
 		require.NoError(t, err)
 		require.True(t, VerifyHexInclusion(root, tree.Size(), uint64(index), id, proof))
-		proof[0][0] ^= 0xff
+		proof.V = 2
 		require.False(t, VerifyHexInclusion(root, tree.Size(), uint64(index), id, proof))
 	}
 }
@@ -49,7 +49,7 @@ func TestBaggedConsistencyProofAcrossMultiPeakTrees(t *testing.T) {
 	}
 	newRoot, err := tree.Root()
 	require.NoError(t, err)
-	proof, err := tree.ConsistencyProof(oldSize)
+	proof, err := tree.ConsistencyProof(oldSize, tree.Size())
 	require.NoError(t, err)
 	require.True(t, VerifyConsistency(oldRoot, newRoot, proof))
 	if len(proof.Witness) > 0 && len(proof.Witness[0]) > 0 {
@@ -93,7 +93,7 @@ func TestAppendApplicationNeutralValue(t *testing.T) {
 	require.Equal(t, uint64(1), position)
 	require.Equal(t, uint64(1), tree.Size())
 
-	proof, err := tree.InclusionProof(0)
+	proof, err := tree.InclusionProof(0, tree.Size())
 	require.NoError(t, err)
 	root, err := tree.Root()
 	require.NoError(t, err)
@@ -124,7 +124,7 @@ func TestEmptyRootAndAdversarialInputs(t *testing.T) {
 	root, err := tree.Root()
 	require.NoError(t, err)
 	require.Equal(t, make([]byte, 32), root)
-	require.False(t, VerifyHexInclusion(root, 0, 0, "bad", nil))
+	require.False(t, VerifyHexInclusion(root, 0, 0, "bad", InclusionProof{}))
 	_, err = New([][]byte{{1}})
 	require.Error(t, err)
 	_, err = New([][]byte{make([]byte, 32), make([]byte, 32)})
@@ -132,5 +132,5 @@ func TestEmptyRootAndAdversarialInputs(t *testing.T) {
 	corrupt := [][]byte{make([]byte, 32), make([]byte, 32), make([]byte, 32)}
 	_, err = New(corrupt)
 	require.Error(t, err)
-	require.False(t, VerifyHexInclusion(make([]byte, 32), 2, 0, fmt.Sprintf("%064x", 1), nil))
+	require.False(t, VerifyHexInclusion(make([]byte, 32), 2, 0, fmt.Sprintf("%064x", 1), InclusionProof{}))
 }

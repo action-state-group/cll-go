@@ -20,8 +20,23 @@ type Tree struct {
 	nodes [][]byte
 }
 
+// InclusionProof proves that an identity is committed at LeafIndex in Size.
+// Witness is the sibling path to the leaf's peak; PeaksLeft and PeaksRight
+// are the remaining peaks in their accumulator order.
+type InclusionProof struct {
+	V          uint64
+	Kind       string
+	Size       uint64
+	LeafIndex  uint64
+	Witness    [][]byte
+	PeaksLeft  [][]byte
+	PeaksRight [][]byte
+}
+
 // ConsistencyProof proves that NewSize append-only extends OldSize.
 type ConsistencyProof struct {
+	V        uint64
+	Kind     string
 	OldSize  uint64
 	NewSize  uint64
 	OldPeaks [][]byte
@@ -116,6 +131,10 @@ func (t *Tree) Root() ([]byte, error) {
 func (t *Tree) PeakHashesAt(size uint64) ([][]byte, error) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
+	return t.peakHashesAtLocked(size)
+}
+
+func (t *Tree) peakHashesAtLocked(size uint64) ([][]byte, error) {
 	if size == 0 {
 		return [][]byte{}, nil
 	}
@@ -129,35 +148,65 @@ func (t *Tree) PeakHashesAt(size uint64) ([][]byte, error) {
 	return cloneProof(peaks), nil
 }
 
-func (t *Tree) InclusionProof(leafIndex uint64) ([][]byte, error) {
+// InclusionProofAt generates the Python-reference-shaped inclusion proof for
+// leafIndex at a complete historical MMR size.
+func (t *Tree) InclusionProofAt(leafIndex, size uint64) (InclusionProof, error) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	if leafIndex >= dtmmr.LeafCount(uint64(len(t.nodes))) {
-		return nil, fmt.Errorf("leaf index %d out of range", leafIndex)
+	if size > uint64(len(t.nodes)) || !validMMRSize(size) || leafIndex >= dtmmr.LeafCount(size) {
+		return InclusionProof{}, fmt.Errorf("invalid MMR inclusion position")
 	}
-	proof, err := dtmmr.InclusionProofBagged(
-		uint64(len(t.nodes)), (*nodeStore)(t), sha256.New(), dtmmr.MMRIndex(leafIndex),
-	)
+	leafPosition := dtmmr.MMRIndex(leafIndex)
+	peakPositions := dtmmr.Peaks(size - 1)
+	peakIndex := containingPeak(uint64(leafPosition), peakPositions)
+	if peakIndex < 0 {
+		return InclusionProof{}, fmt.Errorf("leaf index %d is not contained in MMR", leafIndex)
+	}
+	peak := peakPositions[peakIndex]
+	steps, ok := pathToPeak(peak, dtmmr.IndexHeight(peak), uint64(leafPosition))
+	if !ok {
+		return InclusionProof{}, fmt.Errorf("leaf index %d has no path to MMR peak", leafIndex)
+	}
+	witness := make([][]byte, len(steps))
+	for index, step := range steps {
+		witness[index] = append([]byte(nil), t.nodes[step.sibling]...)
+	}
+	allPeaks, err := t.peakHashesAtLocked(size)
 	if err != nil {
-		return nil, fmt.Errorf("create bagged inclusion proof: %w", err)
+		return InclusionProof{}, fmt.Errorf("read MMR peaks at size %d: %w", size, err)
 	}
-	return cloneProof(proof), nil
+	return InclusionProof{
+		V:          1,
+		Kind:       "inclusion",
+		Size:       size,
+		LeafIndex:  leafIndex,
+		Witness:    witness,
+		PeaksLeft:  cloneProof(allPeaks[:peakIndex]),
+		PeaksRight: cloneProof(allPeaks[peakIndex+1:]),
+	}, nil
 }
 
-func (t *Tree) ConsistencyProof(oldSize uint64) (ConsistencyProof, error) {
+// InclusionProof generates the Python-reference-shaped inclusion proof for
+// leafIndex at a complete historical MMR size.
+func (t *Tree) InclusionProof(leafIndex, size uint64) (InclusionProof, error) {
+	return t.InclusionProofAt(leafIndex, size)
+}
+
+// ConsistencyProofAt generates the Python-reference-shaped consistency proof
+// between two complete historical MMR sizes.
+func (t *Tree) ConsistencyProofAt(oldSize, newSize uint64) (ConsistencyProof, error) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	newSize := uint64(len(t.nodes))
-	if oldSize == 0 || oldSize > newSize || !validMMRSize(oldSize) || !validMMRSize(newSize) {
+	if oldSize > newSize || newSize > uint64(len(t.nodes)) || !validMMRSize(oldSize) || !validMMRSize(newSize) {
 		return ConsistencyProof{}, fmt.Errorf("invalid MMR consistency sizes")
 	}
-	oldPositions := dtmmr.Peaks(oldSize - 1)
-	newPositions := dtmmr.Peaks(newSize - 1)
-	oldPeaks, err := dtmmr.PeakHashes((*nodeStore)(t), oldSize-1)
+	oldPositions := peakPositions(oldSize)
+	newPositions := peakPositions(newSize)
+	oldPeaks, err := t.peakHashesAtLocked(oldSize)
 	if err != nil {
 		return ConsistencyProof{}, fmt.Errorf("read old MMR peaks: %w", err)
 	}
-	newPeaks, err := dtmmr.PeakHashes((*nodeStore)(t), newSize-1)
+	newPeaks, err := t.peakHashesAtLocked(newSize)
 	if err != nil {
 		return ConsistencyProof{}, fmt.Errorf("read new MMR peaks: %w", err)
 	}
@@ -176,17 +225,23 @@ func (t *Tree) ConsistencyProof(oldSize uint64) (ConsistencyProof, error) {
 			witness[index][stepIndex] = append([]byte(nil), t.nodes[step.sibling]...)
 		}
 	}
-	return ConsistencyProof{OldSize: oldSize, NewSize: newSize, OldPeaks: cloneProof(oldPeaks), Witness: cloneWitness(witness), NewPeaks: cloneProof(newPeaks)}, nil
+	return ConsistencyProof{V: 1, Kind: "consistency", OldSize: oldSize, NewSize: newSize, OldPeaks: cloneProof(oldPeaks), Witness: cloneWitness(witness), NewPeaks: cloneProof(newPeaks)}, nil
+}
+
+// ConsistencyProof generates the Python-reference-shaped consistency proof
+// between two complete historical MMR sizes.
+func (t *Tree) ConsistencyProof(oldSize, newSize uint64) (ConsistencyProof, error) {
+	return t.ConsistencyProofAt(oldSize, newSize)
 }
 
 // VerifyConsistency validates the accumulator consistency proof carried by the
 // CLL checkpoint COSE profile.
 func VerifyConsistency(oldRoot, newRoot []byte, proof ConsistencyProof) bool {
-	if len(oldRoot) != hashSize || len(newRoot) != hashSize || proof.OldSize == 0 || proof.OldSize > proof.NewSize || !validMMRSize(proof.OldSize) || !validMMRSize(proof.NewSize) {
+	if len(oldRoot) != hashSize || len(newRoot) != hashSize || proof.V != 1 || proof.Kind != "consistency" || proof.OldSize > proof.NewSize || !validMMRSize(proof.OldSize) || !validMMRSize(proof.NewSize) {
 		return false
 	}
-	oldPositions := dtmmr.Peaks(proof.OldSize - 1)
-	newPositions := dtmmr.Peaks(proof.NewSize - 1)
+	oldPositions := peakPositions(proof.OldSize)
+	newPositions := peakPositions(proof.NewSize)
 	if len(proof.OldPeaks) != len(oldPositions) || len(proof.NewPeaks) != len(newPositions) || len(proof.Witness) != len(oldPositions) {
 		return false
 	}
@@ -226,6 +281,46 @@ func VerifyConsistency(oldRoot, newRoot []byte, proof ConsistencyProof) bool {
 		}
 	}
 	return true
+}
+
+// VerifyInclusion validates a 32-byte CLL identity against an inclusion proof.
+func VerifyInclusion(root []byte, size, leafIndex uint64, value []byte, proof InclusionProof) bool {
+	if len(root) != hashSize || len(value) != hashSize || proof.V != 1 || proof.Kind != "inclusion" || proof.Size != size || proof.LeafIndex != leafIndex || !validMMRSize(size) || leafIndex >= dtmmr.LeafCount(size) {
+		return false
+	}
+	positions := peakPositions(size)
+	leafPosition := uint64(dtmmr.MMRIndex(leafIndex))
+	peakIndex := containingPeak(leafPosition, positions)
+	if peakIndex < 0 || len(proof.PeaksLeft) != peakIndex || len(proof.PeaksRight) != len(positions)-peakIndex-1 {
+		return false
+	}
+	steps, ok := pathToPeak(positions[peakIndex], dtmmr.IndexHeight(positions[peakIndex]), leafPosition)
+	if !ok || len(steps) != len(proof.Witness) {
+		return false
+	}
+	leaf := sha256.Sum256(append([]byte{0}, value...))
+	accumulator := leaf[:]
+	for index, step := range steps {
+		sibling := proof.Witness[index]
+		if len(sibling) != hashSize {
+			return false
+		}
+		if step.targetIsRight {
+			accumulator = interiorHash(sibling, accumulator, step.parent)
+		} else {
+			accumulator = interiorHash(accumulator, sibling, step.parent)
+		}
+	}
+	peaks := make([][]byte, 0, len(positions))
+	for _, collection := range [][][]byte{proof.PeaksLeft, [][]byte{accumulator}, proof.PeaksRight} {
+		for _, peak := range collection {
+			if len(peak) != hashSize {
+				return false
+			}
+			peaks = append(peaks, peak)
+		}
+	}
+	return bytes.Equal(RootFromPeaks(peaks), root)
 }
 
 // RootFromPeaks bags an ordered tallest-to-smallest accumulator into the
@@ -322,7 +417,7 @@ func cloneWitness(input [][][]byte) [][][]byte {
 }
 
 // VerifyHexInclusion decodes an identity and verifies its MMR inclusion proof.
-func VerifyHexInclusion(root []byte, mmrSize, leafIndex uint64, identity string, proof [][]byte) bool {
+func VerifyHexInclusion(root []byte, mmrSize, leafIndex uint64, identity string, proof InclusionProof) bool {
 	id, err := hex.DecodeString(identity)
 	if err != nil || len(id) != hashSize || hex.EncodeToString(id) != identity {
 		return false
@@ -330,25 +425,11 @@ func VerifyHexInclusion(root []byte, mmrSize, leafIndex uint64, identity string,
 	return VerifyInclusion(root, mmrSize, leafIndex, id, proof)
 }
 
-// VerifyInclusion validates a 32-byte CLL identity against a bagged MMR root.
-func VerifyInclusion(root []byte, mmrSize, leafIndex uint64, value []byte, proof [][]byte) bool {
-	if len(root) != hashSize || !validMMRSize(mmrSize) || leafIndex >= dtmmr.LeafCount(mmrSize) || len(value) != hashSize {
-		return false
+func peakPositions(size uint64) []uint64 {
+	if size == 0 {
+		return nil
 	}
-	for _, node := range proof {
-		if len(node) != hashSize {
-			return false
-		}
-	}
-	leaf := sha256.Sum256(append([]byte{0}, value...))
-	return dtmmr.VerifyInclusionBagged(
-		mmrSize,
-		sha256.New(),
-		leaf[:],
-		dtmmr.MMRIndex(leafIndex),
-		proof,
-		root,
-	)
+	return dtmmr.Peaks(size - 1)
 }
 
 func validMMRSize(size uint64) bool {
