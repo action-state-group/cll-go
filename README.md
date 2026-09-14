@@ -10,6 +10,15 @@ signatures, authorization, application indexes, or business workflows. An
 application verifies and stores its complete record first, then appends the
 record's 32-byte identity to CLL.
 
+This neutrality is by decision, not omission. The Python reference
+(`checkpointed-local-log`) additionally ships a **ledger layer** — three-state
+admission control, segment manifests, a lookup index, and a key-revocation
+timeline — that is intentionally **not** part of the Go implementation. `cll-go`
+is the checkpoint + MMR + storage substrate only; admission and revocation
+semantics are Python-only unless a Go consumer's demonstrated need reopens that
+as a separate decision. See `checkpointed-local-log`'s README, "Cross-language
+scope".
+
 ## Install
 
 Requires Go 1.27 or newer.
