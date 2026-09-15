@@ -14,6 +14,11 @@ import (
 
 const hashSize = sha256.Size
 
+// maxMMRSize mirrors the Python reference's MAX_MMR_SIZE (2**50): range
+// verification refuses absurd sizes before any traversal, matching
+// core.verify_range so a size accepted here is also accepted there.
+const maxMMRSize uint64 = 1 << 50
+
 // Tree is an in-memory DataTrails-compatible bagged MMR.
 type Tree struct {
 	mu    sync.RWMutex
@@ -398,6 +403,9 @@ func VerifyInclusion(root []byte, size, leafIndex uint64, value []byte, proof In
 // body digest for leaf index fromIndex+i.
 func VerifyRange(root []byte, size, fromIndex, toIndex uint64, bodyDigests [][]byte, proof RangeProof) bool {
 	if len(root) != hashSize || proof.V != 1 || proof.Kind != "range" {
+		return false
+	}
+	if size >= maxMMRSize {
 		return false
 	}
 	if proof.Size != size || proof.FromIndex != fromIndex || proof.ToIndex != toIndex {
