@@ -1,6 +1,7 @@
 package mmr
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -29,7 +30,17 @@ type conformanceCase struct {
 	SizeB         uint64          `json:"size_b"`
 	RootAHex      string          `json:"root_a_hex"`
 	RootBHex      string          `json:"root_b_hex"`
+	FromIndex     uint64          `json:"from_index"`
+	ToIndex       uint64          `json:"to_index"`
+	BodyDigests   []string        `json:"body_digests"`
+	Expect        *bool           `json:"expect"`
 	Proof         json.RawMessage `json:"proof"`
+}
+
+// expectVerify reports whether the case is a positive. A case is a positive by
+// default; expect==false marks a tamper case that must be rejected.
+func (c conformanceCase) expectVerify() bool {
+	return c.Expect == nil || *c.Expect
 }
 
 type inclusionVectorProof struct {
@@ -52,12 +63,21 @@ type consistencyVectorProof struct {
 	NewPeaks []string   `json:"new_peaks"`
 }
 
+type rangeVectorProof struct {
+	V         uint64   `json:"v"`
+	Kind      string   `json:"kind"`
+	Size      uint64   `json:"size"`
+	FromIndex uint64   `json:"from_index"`
+	ToIndex   uint64   `json:"to_index"`
+	Witness   []string `json:"witness"`
+}
+
 func TestPythonMMRConformanceVectors(t *testing.T) {
 	contents, err := os.ReadFile("testdata/vectors.json")
 	require.NoError(t, err)
 	var vectors conformanceVectors
 	require.NoError(t, json.Unmarshal(contents, &vectors))
-	require.Len(t, vectors.Cases, 19)
+	require.Len(t, vectors.Cases, 26)
 
 	tree, err := New(nil)
 	require.NoError(t, err)
@@ -70,28 +90,46 @@ func TestPythonMMRConformanceVectors(t *testing.T) {
 	firstLeafCovered := false
 	for _, vector := range vectors.Cases {
 		t.Run(vector.Name, func(t *testing.T) {
+			expect := vector.expectVerify()
 			switch vector.Kind {
 			case "root":
 				peaks, err := tree.PeakHashesAt(vector.Size)
 				require.NoError(t, err)
-				require.Equal(t, mustHex(t, vector.RootHex), RootFromPeaks(peaks))
+				require.Equal(t, expect, bytes.Equal(RootFromPeaks(peaks), mustHex(t, vector.RootHex)))
 			case "inclusion":
 				var expected inclusionVectorProof
 				require.NoError(t, json.Unmarshal(vector.Proof, &expected))
-				proof, err := tree.InclusionProof(vector.LeafIndex, vector.Size)
-				require.NoError(t, err)
-				require.Equal(t, inclusionProofFromVector(t, expected), proof)
-				require.True(t, VerifyInclusion(mustHex(t, vector.RootHex), vector.Size, vector.LeafIndex, mustHex(t, vector.BodyDigestHex), proof))
-				if vector.LeafIndex == 0 {
-					firstLeafCovered = true
+				verified := VerifyInclusion(mustHex(t, vector.RootHex), vector.Size, vector.LeafIndex, mustHex(t, vector.BodyDigestHex), inclusionProofFromVector(t, expected))
+				require.Equal(t, expect, verified)
+				if expect {
+					proof, err := tree.InclusionProof(vector.LeafIndex, vector.Size)
+					require.NoError(t, err)
+					require.Equal(t, inclusionProofFromVector(t, expected), proof)
+					if vector.LeafIndex == 0 {
+						firstLeafCovered = true
+					}
 				}
 			case "consistency":
 				var expected consistencyVectorProof
 				require.NoError(t, json.Unmarshal(vector.Proof, &expected))
-				proof, err := tree.ConsistencyProof(vector.SizeA, vector.SizeB)
-				require.NoError(t, err)
-				require.Equal(t, consistencyProofFromVector(t, expected), proof)
-				require.True(t, VerifyConsistency(mustHex(t, vector.RootAHex), mustHex(t, vector.RootBHex), proof))
+				verified := VerifyConsistency(mustHex(t, vector.RootAHex), mustHex(t, vector.RootBHex), consistencyProofFromVector(t, expected))
+				require.Equal(t, expect, verified)
+				if expect {
+					proof, err := tree.ConsistencyProof(vector.SizeA, vector.SizeB)
+					require.NoError(t, err)
+					require.Equal(t, consistencyProofFromVector(t, expected), proof)
+				}
+			case "range":
+				var expected rangeVectorProof
+				require.NoError(t, json.Unmarshal(vector.Proof, &expected))
+				bodies := hexes(t, vector.BodyDigests)
+				verified := VerifyRange(mustHex(t, vector.RootHex), vector.Size, vector.FromIndex, vector.ToIndex, bodies, rangeProofFromVector(t, expected))
+				require.Equal(t, expect, verified)
+				if expect {
+					proof, err := tree.RangeProof(vector.FromIndex, vector.ToIndex, vector.Size)
+					require.NoError(t, err)
+					require.Equal(t, rangeProofFromVector(t, expected), proof)
+				}
 			default:
 				t.Fatalf("unknown vector kind %q", vector.Kind)
 			}
@@ -112,6 +150,11 @@ func consistencyProofFromVector(t *testing.T, proof consistencyVectorProof) Cons
 		witness[index] = hexes(t, proof.Witness[index])
 	}
 	return ConsistencyProof{V: proof.V, Kind: proof.Kind, OldSize: proof.SizeA, NewSize: proof.SizeB, OldPeaks: hexes(t, proof.OldPeaks), Witness: witness, NewPeaks: hexes(t, proof.NewPeaks)}
+}
+
+func rangeProofFromVector(t *testing.T, proof rangeVectorProof) RangeProof {
+	t.Helper()
+	return RangeProof{V: proof.V, Kind: proof.Kind, Size: proof.Size, FromIndex: proof.FromIndex, ToIndex: proof.ToIndex, Witness: hexes(t, proof.Witness)}
 }
 
 func hexes(t *testing.T, values []string) [][]byte {
