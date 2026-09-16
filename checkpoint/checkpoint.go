@@ -247,6 +247,8 @@ func ParseRecord(data []byte) (Record, error) {
 	}
 	if wire.ConsistencyProof != nil {
 		record.ConsistencyProof = &mmr.ConsistencyProof{
+			V:       1,
+			Kind:    "consistency",
 			OldSize: wire.ConsistencyProof.SizeA, NewSize: wire.ConsistencyProof.SizeB,
 			OldPeaks: clonePeaks(wire.ConsistencyProof.OldPeaks),
 			Witness:  cloneWitness(wire.ConsistencyProof.Witness),

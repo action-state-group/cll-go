@@ -14,14 +14,49 @@ import (
 
 const hashSize = sha256.Size
 
+// maxMMRSize mirrors the Python reference's MAX_MMR_SIZE (2**50): range
+// verification refuses absurd sizes before any traversal, matching
+// core.verify_range so a size accepted here is also accepted there.
+const maxMMRSize uint64 = 1 << 50
+
 // Tree is an in-memory DataTrails-compatible bagged MMR.
 type Tree struct {
 	mu    sync.RWMutex
 	nodes [][]byte
 }
 
+// InclusionProof proves that an identity is committed at LeafIndex in Size.
+// Witness is the sibling path to the leaf's peak; PeaksLeft and PeaksRight
+// are the remaining peaks in their accumulator order.
+type InclusionProof struct {
+	V          uint64
+	Kind       string
+	Size       uint64
+	LeafIndex  uint64
+	Witness    [][]byte
+	PeaksLeft  [][]byte
+	PeaksRight [][]byte
+}
+
+// RangeProof carries the leaf-independent sibling set for the inclusive leaf
+// range [FromIndex, ToIndex] against the MMR of Size nodes. Unlike a
+// two-endpoint inclusion check, every leaf in the range participates in the
+// hash chain: the verifier supplies each leaf's body digest and the proof
+// supplies only the O(log size) node hashes those leaves cannot derive.
+// Witness holds node hashes in DFS visitation order.
+type RangeProof struct {
+	V         uint64
+	Kind      string
+	Size      uint64
+	FromIndex uint64
+	ToIndex   uint64
+	Witness   [][]byte
+}
+
 // ConsistencyProof proves that NewSize append-only extends OldSize.
 type ConsistencyProof struct {
+	V        uint64
+	Kind     string
 	OldSize  uint64
 	NewSize  uint64
 	OldPeaks [][]byte
@@ -116,6 +151,10 @@ func (t *Tree) Root() ([]byte, error) {
 func (t *Tree) PeakHashesAt(size uint64) ([][]byte, error) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
+	return t.peakHashesAtLocked(size)
+}
+
+func (t *Tree) peakHashesAtLocked(size uint64) ([][]byte, error) {
 	if size == 0 {
 		return [][]byte{}, nil
 	}
@@ -129,35 +168,65 @@ func (t *Tree) PeakHashesAt(size uint64) ([][]byte, error) {
 	return cloneProof(peaks), nil
 }
 
-func (t *Tree) InclusionProof(leafIndex uint64) ([][]byte, error) {
+// InclusionProofAt generates the Python-reference-shaped inclusion proof for
+// leafIndex at a complete historical MMR size.
+func (t *Tree) InclusionProofAt(leafIndex, size uint64) (InclusionProof, error) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	if leafIndex >= dtmmr.LeafCount(uint64(len(t.nodes))) {
-		return nil, fmt.Errorf("leaf index %d out of range", leafIndex)
+	if size > uint64(len(t.nodes)) || !validMMRSize(size) || leafIndex >= dtmmr.LeafCount(size) {
+		return InclusionProof{}, fmt.Errorf("invalid MMR inclusion position")
 	}
-	proof, err := dtmmr.InclusionProofBagged(
-		uint64(len(t.nodes)), (*nodeStore)(t), sha256.New(), dtmmr.MMRIndex(leafIndex),
-	)
+	leafPosition := dtmmr.MMRIndex(leafIndex)
+	peakPositions := dtmmr.Peaks(size - 1)
+	peakIndex := containingPeak(uint64(leafPosition), peakPositions)
+	if peakIndex < 0 {
+		return InclusionProof{}, fmt.Errorf("leaf index %d is not contained in MMR", leafIndex)
+	}
+	peak := peakPositions[peakIndex]
+	steps, ok := pathToPeak(peak, dtmmr.IndexHeight(peak), uint64(leafPosition))
+	if !ok {
+		return InclusionProof{}, fmt.Errorf("leaf index %d has no path to MMR peak", leafIndex)
+	}
+	witness := make([][]byte, len(steps))
+	for index, step := range steps {
+		witness[index] = append([]byte(nil), t.nodes[step.sibling]...)
+	}
+	allPeaks, err := t.peakHashesAtLocked(size)
 	if err != nil {
-		return nil, fmt.Errorf("create bagged inclusion proof: %w", err)
+		return InclusionProof{}, fmt.Errorf("read MMR peaks at size %d: %w", size, err)
 	}
-	return cloneProof(proof), nil
+	return InclusionProof{
+		V:          1,
+		Kind:       "inclusion",
+		Size:       size,
+		LeafIndex:  leafIndex,
+		Witness:    witness,
+		PeaksLeft:  cloneProof(allPeaks[:peakIndex]),
+		PeaksRight: cloneProof(allPeaks[peakIndex+1:]),
+	}, nil
 }
 
-func (t *Tree) ConsistencyProof(oldSize uint64) (ConsistencyProof, error) {
+// InclusionProof generates the Python-reference-shaped inclusion proof for
+// leafIndex at a complete historical MMR size.
+func (t *Tree) InclusionProof(leafIndex, size uint64) (InclusionProof, error) {
+	return t.InclusionProofAt(leafIndex, size)
+}
+
+// ConsistencyProofAt generates the Python-reference-shaped consistency proof
+// between two complete historical MMR sizes.
+func (t *Tree) ConsistencyProofAt(oldSize, newSize uint64) (ConsistencyProof, error) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	newSize := uint64(len(t.nodes))
-	if oldSize == 0 || oldSize > newSize || !validMMRSize(oldSize) || !validMMRSize(newSize) {
+	if oldSize > newSize || newSize > uint64(len(t.nodes)) || !validMMRSize(oldSize) || !validMMRSize(newSize) {
 		return ConsistencyProof{}, fmt.Errorf("invalid MMR consistency sizes")
 	}
-	oldPositions := dtmmr.Peaks(oldSize - 1)
-	newPositions := dtmmr.Peaks(newSize - 1)
-	oldPeaks, err := dtmmr.PeakHashes((*nodeStore)(t), oldSize-1)
+	oldPositions := peakPositions(oldSize)
+	newPositions := peakPositions(newSize)
+	oldPeaks, err := t.peakHashesAtLocked(oldSize)
 	if err != nil {
 		return ConsistencyProof{}, fmt.Errorf("read old MMR peaks: %w", err)
 	}
-	newPeaks, err := dtmmr.PeakHashes((*nodeStore)(t), newSize-1)
+	newPeaks, err := t.peakHashesAtLocked(newSize)
 	if err != nil {
 		return ConsistencyProof{}, fmt.Errorf("read new MMR peaks: %w", err)
 	}
@@ -176,17 +245,76 @@ func (t *Tree) ConsistencyProof(oldSize uint64) (ConsistencyProof, error) {
 			witness[index][stepIndex] = append([]byte(nil), t.nodes[step.sibling]...)
 		}
 	}
-	return ConsistencyProof{OldSize: oldSize, NewSize: newSize, OldPeaks: cloneProof(oldPeaks), Witness: cloneWitness(witness), NewPeaks: cloneProof(newPeaks)}, nil
+	return ConsistencyProof{V: 1, Kind: "consistency", OldSize: oldSize, NewSize: newSize, OldPeaks: cloneProof(oldPeaks), Witness: cloneWitness(witness), NewPeaks: cloneProof(newPeaks)}, nil
+}
+
+// ConsistencyProof generates the Python-reference-shaped consistency proof
+// between two complete historical MMR sizes.
+func (t *Tree) ConsistencyProof(oldSize, newSize uint64) (ConsistencyProof, error) {
+	return t.ConsistencyProofAt(oldSize, newSize)
+}
+
+// RangeProofAt generates the Python-reference-shaped range proof for the
+// inclusive leaf range [fromIndex, toIndex] at a complete historical MMR size.
+func (t *Tree) RangeProofAt(fromIndex, toIndex, size uint64) (RangeProof, error) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if toIndex < fromIndex {
+		return RangeProof{}, fmt.Errorf("invalid range [%d, %d]", fromIndex, toIndex)
+	}
+	if size > uint64(len(t.nodes)) || !validMMRSize(size) {
+		return RangeProof{}, fmt.Errorf("invalid MMR range size %d", size)
+	}
+	leaves := dtmmr.LeafCount(size)
+	if toIndex >= leaves {
+		return RangeProof{}, fmt.Errorf("to_index %d out of range for size %d (%d leaves)", toIndex, size, leaves)
+	}
+	positions := peakPositions(size)
+	witness := [][]byte{}
+	var leafStart uint64
+	for _, peak := range positions {
+		height := dtmmr.IndexHeight(peak)
+		t.rangeWitnesses(peak, height, leafStart, fromIndex, toIndex, &witness)
+		leafStart += uint64(1) << height
+	}
+	return RangeProof{V: 1, Kind: "range", Size: size, FromIndex: fromIndex, ToIndex: toIndex, Witness: witness}, nil
+}
+
+// RangeProof generates the Python-reference-shaped range proof for the
+// inclusive leaf range [fromIndex, toIndex] at a complete historical MMR size.
+func (t *Tree) RangeProof(fromIndex, toIndex, size uint64) (RangeProof, error) {
+	return t.RangeProofAt(fromIndex, toIndex, size)
+}
+
+// rangeWitnesses depth-first walks the subtree rooted at the 0-based node
+// position peak (covering leaf indices [leafStart, leafStart+2**height-1]):
+// it appends one witness hash for every maximal subtree wholly outside
+// [lo, hi], recurses into any subtree the range only partially covers, and
+// contributes nothing for a subtree wholly inside [lo, hi] (the verifier
+// rebuilds that part from the body leaf hashes it already holds). Mirrors the
+// Python reference _range_witnesses; callers hold t.mu.
+func (t *Tree) rangeWitnesses(peak, height, leafStart, lo, hi uint64, out *[][]byte) {
+	leafEnd := leafStart + (uint64(1) << height) - 1
+	if leafEnd < lo || leafStart > hi {
+		*out = append(*out, append([]byte(nil), t.nodes[peak]...))
+		return
+	}
+	if leafStart >= lo && leafEnd <= hi {
+		return
+	}
+	half := uint64(1) << (height - 1)
+	t.rangeWitnesses(peak-(uint64(1)<<height), height-1, leafStart, lo, hi, out)
+	t.rangeWitnesses(peak-1, height-1, leafStart+half, lo, hi, out)
 }
 
 // VerifyConsistency validates the accumulator consistency proof carried by the
 // CLL checkpoint COSE profile.
 func VerifyConsistency(oldRoot, newRoot []byte, proof ConsistencyProof) bool {
-	if len(oldRoot) != hashSize || len(newRoot) != hashSize || proof.OldSize == 0 || proof.OldSize > proof.NewSize || !validMMRSize(proof.OldSize) || !validMMRSize(proof.NewSize) {
+	if len(oldRoot) != hashSize || len(newRoot) != hashSize || proof.V != 1 || proof.Kind != "consistency" || proof.OldSize > proof.NewSize || !validMMRSize(proof.OldSize) || !validMMRSize(proof.NewSize) {
 		return false
 	}
-	oldPositions := dtmmr.Peaks(proof.OldSize - 1)
-	newPositions := dtmmr.Peaks(proof.NewSize - 1)
+	oldPositions := peakPositions(proof.OldSize)
+	newPositions := peakPositions(proof.NewSize)
 	if len(proof.OldPeaks) != len(oldPositions) || len(proof.NewPeaks) != len(newPositions) || len(proof.Witness) != len(oldPositions) {
 		return false
 	}
@@ -226,6 +354,137 @@ func VerifyConsistency(oldRoot, newRoot []byte, proof ConsistencyProof) bool {
 		}
 	}
 	return true
+}
+
+// VerifyInclusion validates a 32-byte CLL identity against an inclusion proof.
+func VerifyInclusion(root []byte, size, leafIndex uint64, value []byte, proof InclusionProof) bool {
+	if len(root) != hashSize || len(value) != hashSize || proof.V != 1 || proof.Kind != "inclusion" || proof.Size != size || proof.LeafIndex != leafIndex || !validMMRSize(size) || leafIndex >= dtmmr.LeafCount(size) {
+		return false
+	}
+	positions := peakPositions(size)
+	leafPosition := uint64(dtmmr.MMRIndex(leafIndex))
+	peakIndex := containingPeak(leafPosition, positions)
+	if peakIndex < 0 || len(proof.PeaksLeft) != peakIndex || len(proof.PeaksRight) != len(positions)-peakIndex-1 {
+		return false
+	}
+	steps, ok := pathToPeak(positions[peakIndex], dtmmr.IndexHeight(positions[peakIndex]), leafPosition)
+	if !ok || len(steps) != len(proof.Witness) {
+		return false
+	}
+	leaf := sha256.Sum256(append([]byte{0}, value...))
+	accumulator := leaf[:]
+	for index, step := range steps {
+		sibling := proof.Witness[index]
+		if len(sibling) != hashSize {
+			return false
+		}
+		if step.targetIsRight {
+			accumulator = interiorHash(sibling, accumulator, step.parent)
+		} else {
+			accumulator = interiorHash(accumulator, sibling, step.parent)
+		}
+	}
+	peaks := make([][]byte, 0, len(positions))
+	for _, collection := range [][][]byte{proof.PeaksLeft, [][]byte{accumulator}, proof.PeaksRight} {
+		for _, peak := range collection {
+			if len(peak) != hashSize {
+				return false
+			}
+			peaks = append(peaks, peak)
+		}
+	}
+	return bytes.Equal(RootFromPeaks(peaks), root)
+}
+
+// VerifyRange validates the inclusive leaf range [fromIndex, toIndex] against
+// a range proof. It never panics and returns false on any problem. Every leaf
+// in the range participates, so an altered, deleted, or replaced interior leaf
+// changes the peak it falls under and is caught here. bodyDigests[i] is the
+// body digest for leaf index fromIndex+i.
+func VerifyRange(root []byte, size, fromIndex, toIndex uint64, bodyDigests [][]byte, proof RangeProof) bool {
+	if len(root) != hashSize || proof.V != 1 || proof.Kind != "range" {
+		return false
+	}
+	if size >= maxMMRSize {
+		return false
+	}
+	if proof.Size != size || proof.FromIndex != fromIndex || proof.ToIndex != toIndex {
+		return false
+	}
+	if toIndex < fromIndex || uint64(len(bodyDigests)) != toIndex-fromIndex+1 {
+		return false
+	}
+	leaves, ok := LeafCount(size)
+	if !ok || toIndex >= leaves {
+		return false
+	}
+	for _, digest := range bodyDigests {
+		if len(digest) != hashSize {
+			return false
+		}
+	}
+	for _, node := range proof.Witness {
+		if len(node) != hashSize {
+			return false
+		}
+	}
+	digestByIndex := make(map[uint64][]byte, len(bodyDigests))
+	for index, digest := range bodyDigests {
+		digestByIndex[fromIndex+uint64(index)] = digest
+	}
+	positions := peakPositions(size)
+	cursor := 0
+	reconstructed := make([][]byte, 0, len(positions))
+	var leafStart uint64
+	for _, peak := range positions {
+		height := dtmmr.IndexHeight(peak)
+		node, ok := reconstructRangeSubtree(peak, height, leafStart, fromIndex, toIndex, digestByIndex, proof.Witness, &cursor)
+		if !ok {
+			return false
+		}
+		reconstructed = append(reconstructed, node)
+		leafStart += uint64(1) << height
+	}
+	if cursor != len(proof.Witness) {
+		return false
+	}
+	return bytes.Equal(RootFromPeaks(reconstructed), root)
+}
+
+// reconstructRangeSubtree rebuilds the hash of the subtree rooted at the 0-based
+// node position peak. A subtree wholly outside [lo, hi] consumes one witness
+// hash; a leaf wholly inside is rebuilt from its body digest; a partially
+// covered subtree recurses. Mirrors the Python reference
+// _reconstruct_range_subtree. It reports false instead of panicking when the
+// witness is exhausted or a required body digest is missing.
+func reconstructRangeSubtree(peak, height, leafStart, lo, hi uint64, digestByIndex map[uint64][]byte, witness [][]byte, cursor *int) ([]byte, bool) {
+	leafEnd := leafStart + (uint64(1) << height) - 1
+	if leafEnd < lo || leafStart > hi {
+		if *cursor >= len(witness) {
+			return nil, false
+		}
+		node := witness[*cursor]
+		*cursor++
+		return node, true
+	}
+	if height == 0 {
+		body, ok := digestByIndex[leafStart]
+		if !ok {
+			return nil, false
+		}
+		leaf := sha256.Sum256(append([]byte{0}, body...))
+		return leaf[:], true
+	}
+	half := uint64(1) << (height - 1)
+	left, ok := reconstructRangeSubtree(peak-(uint64(1)<<height), height-1, leafStart, lo, hi, digestByIndex, witness, cursor)
+	if !ok {
+		return nil, false
+	}
+	right, ok := reconstructRangeSubtree(peak-1, height-1, leafStart+half, lo, hi, digestByIndex, witness, cursor)
+	if !ok {
+		return nil, false
+	}
+	return interiorHash(left, right, peak), true
 }
 
 // RootFromPeaks bags an ordered tallest-to-smallest accumulator into the
@@ -322,7 +581,7 @@ func cloneWitness(input [][][]byte) [][][]byte {
 }
 
 // VerifyHexInclusion decodes an identity and verifies its MMR inclusion proof.
-func VerifyHexInclusion(root []byte, mmrSize, leafIndex uint64, identity string, proof [][]byte) bool {
+func VerifyHexInclusion(root []byte, mmrSize, leafIndex uint64, identity string, proof InclusionProof) bool {
 	id, err := hex.DecodeString(identity)
 	if err != nil || len(id) != hashSize || hex.EncodeToString(id) != identity {
 		return false
@@ -330,25 +589,11 @@ func VerifyHexInclusion(root []byte, mmrSize, leafIndex uint64, identity string,
 	return VerifyInclusion(root, mmrSize, leafIndex, id, proof)
 }
 
-// VerifyInclusion validates a 32-byte CLL identity against a bagged MMR root.
-func VerifyInclusion(root []byte, mmrSize, leafIndex uint64, value []byte, proof [][]byte) bool {
-	if len(root) != hashSize || !validMMRSize(mmrSize) || leafIndex >= dtmmr.LeafCount(mmrSize) || len(value) != hashSize {
-		return false
+func peakPositions(size uint64) []uint64 {
+	if size == 0 {
+		return nil
 	}
-	for _, node := range proof {
-		if len(node) != hashSize {
-			return false
-		}
-	}
-	leaf := sha256.Sum256(append([]byte{0}, value...))
-	return dtmmr.VerifyInclusionBagged(
-		mmrSize,
-		sha256.New(),
-		leaf[:],
-		dtmmr.MMRIndex(leafIndex),
-		proof,
-		root,
-	)
+	return dtmmr.Peaks(size - 1)
 }
 
 func validMMRSize(size uint64) bool {

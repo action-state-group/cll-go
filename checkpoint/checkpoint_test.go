@@ -145,7 +145,7 @@ func TestLinkedCheckpointCarriesConsistencyProof(t *testing.T) {
 	require.NoError(t, err)
 	oldPeaks, err := tree.PeakHashesAt(oldSize)
 	require.NoError(t, err)
-	proof, err := tree.ConsistencyProof(oldSize)
+	proof, err := tree.ConsistencyProof(oldSize, tree.Size())
 	require.NoError(t, err)
 	payload, err := (Payload{
 		LogID: "interop-log", KeyID: signer.KeyID(), MMRSize: tree.Size(), Root: hex.EncodeToString(newRoot),
